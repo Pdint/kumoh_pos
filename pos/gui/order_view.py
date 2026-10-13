@@ -308,11 +308,11 @@ class OrderView(ttk.Frame):
         self.sum_labels["total"].configure(text=won(calc["total"]))
         notes = []
         if calc["time_discount"]:
-            notes.append(f"⏰ {calc['time_discount_name']} -{calc['time_discount']:,}")
+            notes.append(f"시간대 할인: {calc['time_discount_name']} -{calc['time_discount']:,}")
         if calc["coupon_discount"]:
-            notes.append(f"🎟 쿠폰 -{calc['coupon_discount']:,}")
+            notes.append(f"쿠폰 할인 -{calc['coupon_discount']:,}")
         if calc["points_used"]:
-            notes.append(f"Ⓟ 포인트 -{calc['points_used']:,}")
+            notes.append(f"포인트 사용 -{calc['points_used']:,}")
         if calc["paid"]:
             notes.append(f"결제됨 {calc['paid']:,} / 남은 금액 {calc['remaining']:,}")
         notes += calc["warnings"]

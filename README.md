@@ -1,4 +1,4 @@
-# 🍢 금오분식 POS 시스템
+# 금오분식 POS 시스템
 
 분식집 **금오분식**을 위한 GUI 기반 POS(Point-Of-Sale) 프로그램입니다.
 테이블·포장 주문, 분할 결제, 할인·회원 포인트, 레시피 기반 재고, 주방 화면, 예약, 직원 급여, 매출 통계, 일일 마감까지 지원합니다.
@@ -12,6 +12,33 @@
 ![주문 화면](docs/images/order.png)
 
 ## 실행 방법
+
+### 1) exe로 실행 (Windows, Python 설치 불필요)
+
+`KumohPOS.exe`를 원하는 폴더에 두고 더블클릭합니다.
+
+- 데이터는 **exe와 같은 폴더**에 저장됩니다: `data\pos.db`, `receipts\`, `reports\`, `exports\`, `backups\`
+  (USB 등으로 exe 폴더째 옮기면 데이터도 함께 이동)
+- 통계 시연용 샘플 데이터: 명령 프롬프트에서 `KumohPOS.exe --demo 60`
+  또는 관리자 모드 → 설정 → "샘플 판매 데이터 생성"
+- 단일 파일 exe라 실행 시 임시 폴더에 압축을 풀기 때문에 첫 화면까지 몇 초 걸립니다.
+- 처음 실행할 때 Windows SmartScreen이 "알 수 없는 게시자" 경고를 띄우면 **추가 정보 → 실행**을 누르세요.
+  (코드 서명이 없는 개인 제작 프로그램이라 나타나는 경고입니다)
+- 예기치 못한 오류는 `data\error.log`에 기록됩니다.
+
+### 2) exe 직접 빌드
+
+Windows에 Python 3.9 이상을 설치한 뒤 프로젝트 폴더에서 **`build_exe.bat`** 을 더블클릭하면
+PyInstaller 설치 → 테스트 → 빌드가 진행되고 `dist\KumohPOS.exe`가 만들어집니다.
+
+```bat
+python -m pip install pyinstaller
+python -m PyInstaller --noconfirm --clean kumoh_pos.spec
+```
+
+빌드 설정은 `kumoh_pos.spec` (콘솔 창 없음, 단일 파일, 아이콘 `assets/kumoh_pos.ico`)
+
+### 3) Python으로 실행
 
 ```bash
 python main.py                # 실행 (처음 실행 시 기본 메뉴/재료/테이블/직원 자동 생성)
@@ -65,7 +92,10 @@ python -m unittest discover -s tests -v
 ## 프로젝트 구조
 
 ```
-main.py                    실행 진입점
+main.py                    실행 진입점 (exe 실행 시 데이터 경로·오류 로그 처리 포함)
+kumoh_pos.spec             PyInstaller exe 빌드 설정
+build_exe.bat              Windows용 exe 빌드 스크립트
+assets/kumoh_pos.ico       프로그램 아이콘
 pos/
   config.py                가게 정보 · 제한사항 상수
   db.py                    SQLite 스키마 · 초기 데이터 · 비밀번호 해시

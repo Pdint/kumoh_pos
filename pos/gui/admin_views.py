@@ -198,7 +198,7 @@ class InventoryView(ttk.Frame):
             ids.append(i["id"])
             tags.append("warn" if is_low else "")
         fill_tree(self.tree, rows, ids, tags)
-        self.summary.configure(text=f"⚠ 재고 부족 재료 {low}개 — 입고가 필요합니다." if low else "")
+        self.summary.configure(text=f"[주의] 재고 부족 재료 {low}개 — 입고가 필요합니다." if low else "")
         self.logs.delete(*self.logs.get_children())
 
     def show_logs(self):
@@ -690,7 +690,7 @@ class ClosingView(ttk.Frame):
         text = run_safe(self, self.pos.reports.closing_text, d)
         if text:
             closed = self.pos.reports.is_closed(d)
-            self.state_lbl.configure(text="✔ 마감 완료" if closed else "미마감",
+            self.state_lbl.configure(text="마감 완료" if closed else "미마감",
                                      foreground=COLORS["ok"] if closed else COLORS["accent"])
             self._show(text)
 

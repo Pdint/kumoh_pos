@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import tkinter as tk
+import traceback
 from tkinter import messagebox, simpledialog, ttk
+from typing import Callable
 
 from .. import config
 from ..services.staff import KINDS
@@ -24,11 +26,18 @@ ADMIN_TABS = [("주문 내역·환불", OrderHistoryView), ("매출 통계", Sta
 
 
 class App(tk.Tk):
-    def __init__(self, pos: PosSystem):
+    def __init__(self, pos: PosSystem, icon: str | None = None,
+                 error_log: Callable[[str], str] | None = None):
         super().__init__()
         self.pos = pos
+        self.error_log = error_log
         init_fonts(self)
         self.title(f"{config.STORE_NAME} POS")
+        if icon:
+            try:
+                self.iconbitmap(default=icon)
+            except tk.TclError:
+                pass
         self.geometry("1400x840")
         self.minsize(1200, 760)
         self.configure(bg=COLORS["bg"])
@@ -52,11 +61,18 @@ class App(tk.Tk):
         self.after(1500, self._check_reservations)
         self.after(800, self._startup_stock_check)
 
+    def report_callback_exception(self, exc, val, tb):
+        """예상치 못한 오류: 프로그램을 끄지 않고 알린 뒤 로그 파일에 기록한다."""
+        text = "".join(traceback.format_exception(exc, val, tb))
+        where = self.error_log(text) if self.error_log else None
+        messagebox.showerror("오류", f"처리 중 오류가 발생했습니다: {val}"
+                             + (f"\n\n로그: {where}" if where else ""), parent=self)
+
     # ---------------------------------------------------------------- 상단 바
     def _build_header(self):
         head = tk.Frame(self, bg=COLORS["header"], height=52)
         head.pack(fill="x")
-        tk.Label(head, text=f"🍢 {config.STORE_NAME}", bg=COLORS["header"], fg="white",
+        tk.Label(head, text=config.STORE_NAME, bg=COLORS["header"], fg="white",
                  font=font(17, True)).pack(side="left", padx=(14, 4), pady=8)
         tk.Label(head, text=config.STORE_SUBTITLE, bg=COLORS["header"], fg="#9ca3af",
                  font=font(10)).pack(side="left", pady=(10, 0))
@@ -81,7 +97,7 @@ class App(tk.Tk):
             self.mode_btn.configure(text="사용자 모드로 전환", bg="#fde68a")
         else:
             self.mode_lbl.configure(text="사용자 모드", bg="#374151", fg="white")
-            self.mode_btn.configure(text="🔒 관리자 모드 (F12)", bg="#e5e7eb")
+            self.mode_btn.configure(text="관리자 모드 (F12)", bg="#e5e7eb")
 
     def toggle_mode(self):
         if self.pos.auth.is_admin:
@@ -168,7 +184,7 @@ class App(tk.Tk):
 
     def _update_alert(self):
         due = self.pos.reservations.due()
-        self.alert_lbl.configure(text=f"🔔 예약 {len(due)}건 도래" if due else "")
+        self.alert_lbl.configure(text=f"[알림] 예약 {len(due)}건 도래" if due else "")
         return due
 
     def _check_reservations(self):
@@ -248,6 +264,7 @@ class App(tk.Tk):
             self.destroy()
 
 
-def run(pos: PosSystem) -> None:
-    app = App(pos)
+def run(pos: PosSystem, icon: str | None = None,
+        error_log: Callable[[str], str] | None = None) -> None:
+    app = App(pos, icon=icon, error_log=error_log)
     app.mainloop()

@@ -189,8 +189,8 @@ class StatsView(ttk.Frame):
         if menus:
             by_qty = max(menus, key=lambda m: m["qty"])
             by_rev = max(menus, key=lambda m: m["revenue"])
-            self.best_lbl.configure(text=f"🏆 최다 판매: {by_qty['name']}({by_qty['qty']}개)   "
-                                         f"💰 최고 매출: {by_rev['name']}({by_rev['revenue']:,}원)")
+            self.best_lbl.configure(text=f"[최다 판매]  {by_qty['name']}({by_qty['qty']}개)   "
+                                         f"[최고 매출]  {by_rev['name']}({by_rev['revenue']:,}원)")
         else:
             self.best_lbl.configure(text="판매 내역 없음")
 

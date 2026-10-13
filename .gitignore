@@ -7,3 +7,5 @@ receipts/
 exports/
 backups/
 .venv/
+build/
+dist/
