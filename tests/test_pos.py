@@ -382,5 +382,203 @@ class ReservationAuthTest(PosTestCase):
         self.assertTrue(self.pos.auth.is_admin)
 
 
+class NewFeatureTest(PosTestCase):
+    def opt(self, menu, name):
+        return next(o["id"] for o in self.pos.menu.options(self.menu[menu]) if o["name"] == name)
+
+    # ---- 계좌이체
+    def test_transfer_payment_in_stats_and_receipt(self):
+        oid = self.new_order(떡볶이=1)
+        self.pos.payments.pay(oid, "TRANSFER")
+        d = "2026-10-12"
+        m = {x["method"]: x for x in self.pos.stats.by_payment_method(d, d)}
+        self.assertEqual(m["TRANSFER"]["amount"], 4500)
+        self.assertIn("계좌이체", self.pos.reports.receipt(oid))
+        self.assertIn("계좌이체", self.pos.reports.closing_text(d))
+
+    # ---- 메뉴 옵션 / 요청사항
+    def test_option_price_and_stock(self):
+        cheese = self.stock("치즈")
+        oid = self.pos.orders.create_order(1)
+        self.pos.orders.add_item(oid, self.menu["떡볶이"], 2,
+                                 option_ids=[self.opt("떡볶이", "치즈 추가"), self.opt("떡볶이", "매운맛")])
+        it = self.pos.orders.items(oid)[0]
+        self.assertEqual(it["unit_price"], 5000)
+        self.assertEqual(it["options"], "매운맛, 치즈 추가")
+        self.assertEqual(self.stock("치즈"), cheese - 2)
+        self.pos.orders.set_item_qty(it["id"], 1)          # 감소 시 옵션 재료도 복구
+        self.assertEqual(self.stock("치즈"), cheese - 1)
+        self.pos.orders.cancel_order(oid)
+        self.assertEqual(self.stock("치즈"), cheese)
+
+    def test_option_group_is_exclusive(self):
+        oid = self.pos.orders.create_order(1)
+        with self.assertRaises(PosError):
+            self.pos.orders.add_item(oid, self.menu["떡볶이"], 1, option_ids=[
+                self.opt("떡볶이", "순한맛"), self.opt("떡볶이", "매운맛")])
+
+    def test_different_options_or_memo_are_separate_lines(self):
+        oid = self.pos.orders.create_order(1)
+        self.pos.orders.add_item(oid, self.menu["라면"], 1)
+        self.pos.orders.add_item(oid, self.menu["라면"], 1, option_ids=[self.opt("라면", "곱빼기")])
+        self.pos.orders.add_item(oid, self.menu["라면"], 1, memo="파 빼주세요")
+        self.pos.orders.add_item(oid, self.menu["라면"], 1)  # 첫 줄에 합산
+        qtys = sorted(i["qty"] for i in self.pos.orders.items(oid))
+        self.assertEqual(qtys, [1, 1, 2])
+
+    def test_memo_rules(self):
+        oid = self.new_order(라면=1)
+        it = self.pos.orders.items(oid)[0]
+        self.pos.orders.set_item_memo(it["id"], "  덜   맵게 ")
+        self.assertEqual(self.pos.orders.items(oid)[0]["memo"], "덜 맵게")
+        with self.assertRaises(PosError):
+            self.pos.orders.set_item_memo(it["id"], "가" * 41)
+        self.pos.orders.start_cooking(it["id"])
+        with self.assertRaises(PosError):
+            self.pos.orders.set_item_memo(it["id"], "변경")
+
+    def test_option_soldout_when_option_ingredient_out(self):
+        self.pos.db.execute("UPDATE ingredients SET stock=0 WHERE id=?", (self.ing["치즈"],))
+        oid = self.pos.orders.create_order(1)
+        with self.assertRaises(PosError):
+            self.pos.orders.add_item(oid, self.menu["떡볶이"], 1,
+                                     option_ids=[self.opt("떡볶이", "치즈 추가")])
+        self.pos.orders.add_item(oid, self.menu["떡볶이"], 1)  # 옵션 없이는 주문 가능
+
+    def test_option_admin_validation(self):
+        with self.assertRaises(PosError):
+            self.pos.menu.add_option(self.menu["라면"], "황금", 150)  # 100원 단위 아님
+        oid = self.pos.menu.add_option(self.menu["라면"], "떡 추가", 1000, "", self.ing["떡"], 1)
+        self.pos.menu.delete_option(oid)
+        self.assertNotIn(oid, [o["id"] for o in self.pos.menu.options(self.menu["라면"])])
+
+    # ---- 주방 주문서
+    def test_kitchen_ticket_only_new_items(self):
+        oid = self.new_order(떡볶이=2)
+        t1 = self.pos.orders.kitchen_ticket(oid)
+        self.assertIn("[주방 주문서]", t1)
+        self.assertIn("+2", t1)
+        with self.assertRaises(PosError):
+            self.pos.orders.kitchen_ticket(oid)
+        self.pos.orders.add_item(oid, self.menu["콜라"], 1, memo="얼음컵")
+        item = next(i for i in self.pos.orders.items(oid) if i["name"] == "떡볶이")
+        self.pos.orders.set_item_qty(item["id"], 1)
+        t2 = self.pos.orders.kitchen_ticket(oid)
+        self.assertIn("[추가 주문서]", t2)
+        self.assertIn("콜라", t2)
+        self.assertIn("얼음컵", t2)
+        self.assertIn("취소 1", t2)
+
+    def test_printer_disabled_saves_file(self):
+        self.pos.printer.set_enabled(False)
+        r = self.pos.printer.print_text("테스트", "t1")
+        self.assertFalse(r["printed"])
+        self.assertTrue(os.path.exists(r["path"]))
+
+    def test_printer_backend_called_or_fails_gracefully(self):
+        sent = []
+        self.pos.printer.backend = sent.append
+        self.assertTrue(self.pos.printer.print_text("x", "t2")["printed"])
+        self.assertEqual(len(sent), 1)
+
+        def broken(path):
+            raise OSError("프린터 없음")
+        self.pos.printer.backend = broken
+        r = self.pos.printer.print_text("x", "t3")
+        self.assertFalse(r["printed"])
+        self.assertIn("프린터 없음", r["message"])
+
+    # ---- 부분 환불
+    def test_partial_refund(self):
+        mid = self.pos.members.register("부분", "010-4444-5555")
+        oid = self.new_order(쫄면=2, 떡볶이=1)  # 16,500
+        self.pos.payments.attach_member(oid, mid)
+        self.pos.payments.pay(oid, "CARD")       # 적립 165P
+        items = {i["name"]: i["id"] for i in self.pos.orders.items(oid)}
+        amt = self.pos.payments.refund_items(oid, {items["쫄면"]: 1}, "하나 안 나옴", restock=True)
+        self.assertEqual(amt, 6000)
+        self.assertEqual(self.pos.orders.get(oid)["status"], "PAID")
+        d = "2026-10-12"
+        s = self.pos.stats.summary(d, d)
+        self.assertEqual(s["refund_amount"], 6000)
+        self.assertEqual(s["net_sales"], 10500)
+        self.assertEqual(s["sales"], 10500)
+        self.assertEqual(s["cost"], 1900 + 1500)
+        qty = {m["name"]: m["qty"] for m in self.pos.stats.menu_stats(d, d)}
+        self.assertEqual(qty["쫄면"], 1)
+        self.assertEqual(self.pos.members.get(mid)["points"], 165 - int(165 * 6000 / 16500))
+        with self.assertRaises(PosError):  # 이미 환불한 수량 초과
+            self.pos.payments.refund_items(oid, {items["쫄면"]: 2}, "x")
+        self.assertIn("부분 환불", self.pos.reports.receipt(oid))
+        # 남은 메뉴를 모두 환불하면 전체 환불로 전환
+        rest = self.pos.payments.refund_items(oid, {items["쫄면"]: 1, items["떡볶이"]: 1}, "전부")
+        self.assertEqual(rest, 10500)
+        self.assertEqual(self.pos.orders.get(oid)["status"], "REFUNDED")
+        self.assertEqual(self.pos.stats.summary(d, d)["refund_amount"], 16500)
+        self.assertEqual(self.pos.members.get(mid)["points"], 0)
+
+    def test_partial_refund_across_methods(self):
+        oid = self.new_order(쫄면=2)  # 12,000
+        self.pos.payments.pay(oid, "CASH", amount=2000)
+        self.pos.payments.pay(oid, "CARD")
+        it = self.pos.orders.items(oid)[0]
+        self.pos.payments.refund_items(oid, {it["id"]: 1}, "변심", method="CASH")
+        by = {r["method"]: r["amount"] for r in self.pos.payments.refunds(oid)}
+        self.assertEqual(by, {"CASH": 2000, "CARD": 4000})
+        m = {x["method"]: x for x in self.pos.stats.by_payment_method("2026-10-12", "2026-10-12")}
+        self.assertEqual(m["CASH"]["amount"], 0)
+        self.assertEqual(m["CARD"]["amount"], 6000)
+
+    # ---- 기간 비교
+    def test_compare_periods(self):
+        from pos.services.stats import previous_range
+        self.assertEqual(previous_range("2026-10-01", "2026-10-31"), ("2026-09-01", "2026-09-30"))
+        self.assertEqual(previous_range("2026-01-01", "2026-12-31"), ("2025-01-01", "2025-12-31"))
+        self.assertEqual(previous_range("2026-10-12", "2026-10-18"), ("2026-10-05", "2026-10-11"))
+        self.assertEqual(previous_range("2026-10-01", "2026-10-14"), ("2026-09-01", "2026-09-14"))
+        self.assertEqual(previous_range("2026-03-01", "2026-03-31"), ("2026-02-01", "2026-02-28"))
+        self.assertEqual(previous_range("2026-03-01", "2026-03-30"), ("2026-02-01", "2026-02-28"))
+        self.clock.dt = datetime(2026, 10, 5, 12, 0)
+        self.pos.payments.pay(self.new_order(1, 떡볶이=1), "CARD")
+        self.clock.dt = datetime(2026, 10, 12, 12, 0)
+        self.pos.payments.pay(self.new_order(1, 떡볶이=2), "CARD")
+        c = self.pos.stats.compare("2026-10-12", "2026-10-18")
+        net = next(m for m in c["metrics"] if m["key"] == "net_sales")
+        self.assertEqual((net["current"], net["previous"], net["diff"]), (9000, 4500, 4500))
+        self.assertAlmostEqual(net["rate"], 100.0)
+        self.assertEqual(c["menus"][0]["qty_diff"], 1)
+
+    # ---- 복원
+    def test_backup_and_restore(self):
+        path = self.pos.reports.backup()
+        self.pos.members.register("복원후사라짐", "010-9090-9090")
+        safety = self.pos.reports.restore(path)
+        self.assertTrue(os.path.exists(safety))
+        self.assertEqual(self.pos.members.members("복원후사라짐"), [])
+        bad = os.path.join(self.tmp.name, "bad.db")
+        with open(bad, "w") as f:
+            f.write("not a db")
+        with self.assertRaises(PosError):
+            self.pos.reports.restore(bad)
+
+    def test_migration_of_old_db(self):
+        import sqlite3
+        from pos.db import Database
+        path = os.path.join(self.tmp.name, "old.db")
+        con = sqlite3.connect(path)
+        con.executescript("""
+            CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE order_items (id INTEGER PRIMARY KEY, order_id INTEGER, menu_id INTEGER,
+                name TEXT, unit_price INTEGER, unit_cost INTEGER, discount_rate INTEGER, qty INTEGER,
+                paid_qty INTEGER, status TEXT, ordered_at TEXT, done_at TEXT);
+        """)
+        con.commit()
+        con.close()
+        db = Database(path)
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(order_items)")}
+        self.assertTrue({"options", "memo", "refunded_qty", "ticket_qty"} <= cols)
+        db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,7 +6,7 @@ from tkinter import messagebox, simpledialog, ttk
 
 from .. import config
 from .payment_dialog import PaymentDialog
-from .widgets import COLORS, center, font, make_tree, run_safe, won
+from .widgets import COLORS, TextDialog, center, font, make_tree, run_safe, won
 
 ITEM_STATUS = {"WAITING": "대기", "COOKING": "조리중", "DONE": "완료"}
 
@@ -208,10 +208,25 @@ class OrderView(ttk.Frame):
                 return
             if self.current_order_id is None:
                 return
-        warnings = run_safe(self, self.pos.orders.add_item, self.current_order_id, menu_id, qty)
+        options, memo = (), ""
+        if self.pos.menu.options(menu_id):
+            choice = OptionDialog(self, self.pos, menu_id).result
+            if choice is None:
+                self._leave_current_if_empty()
+                return
+            options, qty, memo = choice
+        warnings = run_safe(self, self.pos.orders.add_item, self.current_order_id, menu_id, qty,
+                            option_ids=options, memo=memo)
         self.refresh()
         if warnings:
             self.app.show_stock_warnings(warnings)
+
+    def _leave_current_if_empty(self):
+        if self.current_order_id:
+            self.pos.orders.discard_if_empty(self.current_order_id)
+            if not self.pos.db.query_one("SELECT 1 FROM orders WHERE id=?", (self.current_order_id,)):
+                self.current_order_id = None
+        self.refresh()
 
     # ================================================================ 우측: 현재 주문
     def _build_order_panel(self):
@@ -230,12 +245,19 @@ class OrderView(ttk.Frame):
             anchor_right=("price", "qty", "amount"))
         self.tree.tag_configure("done", foreground=COLORS["ok"])
         self.tree.tag_configure("cooking", foreground=COLORS["accent"])
+        self.tree.tag_configure("unsent", foreground=COLORS["primary"])
 
         edit = ttk.Frame(right)
         edit.pack(fill="x")
         for text, cmd in (("+1", lambda: self.change_qty(1)), ("-1", lambda: self.change_qty(-1)),
                           ("수량 입력", self.input_qty), ("항목 삭제", self.delete_item)):
             ttk.Button(edit, text=text, command=cmd).pack(side="left", expand=True, fill="x", padx=1)
+        edit2 = ttk.Frame(right)
+        edit2.pack(fill="x", pady=(2, 0))
+        ttk.Button(edit2, text="요청사항", command=self.edit_memo).pack(
+            side="left", expand=True, fill="x", padx=1)
+        ttk.Button(edit2, text="주방 주문서 출력", command=self.send_kitchen).pack(
+            side="left", expand=True, fill="x", padx=1)
 
         summary = tk.Frame(right, bg="white", bd=1, relief="solid")
         summary.pack(fill="x", pady=6)
@@ -295,12 +317,19 @@ class OrderView(ttk.Frame):
         for it in self.pos.orders.items(oid):
             unit = it["unit_price"] - self.pos.discount.item_discount(it["unit_price"],
                                                                      it["discount_rate"])
-            name = it["name"] + (f" ({it['discount_rate']}%↓)" if it["discount_rate"] else "")
+            name = self.pos.orders.item_label(it)
+            if it["discount_rate"]:
+                name += f" ({it['discount_rate']}%↓)"
+            if it["memo"]:
+                name += f" *{it['memo']}"
             if it["paid_qty"]:
                 name += f" [결제 {it['paid_qty']}]"
             tag = {"DONE": "done", "COOKING": "cooking"}.get(it["status"], "")
+            state = ITEM_STATUS[it["status"]]
+            if it["qty"] != it["ticket_qty"] and order["status"] == "OPEN":
+                state, tag = "미전송", "unsent"
             self.tree.insert("", "end", iid=str(it["id"]), tags=(tag,), values=(
-                name, f"{unit:,}", it["qty"], f"{unit * it['qty']:,}", ITEM_STATUS[it["status"]]))
+                name, f"{unit:,}", it["qty"], f"{unit * it['qty']:,}", state))
         calc = self.pos.discount.calculate(oid)
         disc = calc["subtotal"] - calc["total"]
         self.sum_labels["subtotal"].configure(text=won(calc["subtotal"]))
@@ -354,6 +383,30 @@ class OrderView(ttk.Frame):
         item = self._selected_item()
         if item and messagebox.askyesno("확인", f"'{item['name']}'을(를) 삭제할까요?", parent=self):
             self._set_qty(item, 0)
+
+    def edit_memo(self):
+        item = self._selected_item()
+        if not item:
+            return
+        memo = simpledialog.askstring(
+            "요청사항", f"{item['name']} 요청사항 ({config.MAX_MEMO_LENGTH}자 이내, 비우면 삭제)",
+            parent=self, initialvalue=item["memo"])
+        if memo is not None and run_safe(self, self.pos.orders.set_item_memo, item["id"], memo):
+            self.refresh()
+
+    def send_kitchen(self):
+        if not self.current_order_id:
+            messagebox.showinfo("알림", "주문을 먼저 선택하세요.", parent=self)
+            return
+        text = run_safe(self, self.pos.orders.kitchen_ticket, self.current_order_id)
+        if not text:
+            return
+        order = self.pos.orders.get(self.current_order_id)
+        result = self.pos.printer.print_text(
+            text, f"kitchen_{order['created_at'][:10]}_{order['order_no']:03d}_"
+                  f"{self.pos.db.now().strftime('%H%M%S')}")
+        self.refresh()
+        TextDialog(self, "주방 주문서", text, note=result["message"])
 
     def cancel_order(self):
         if not self.current_order_id:
@@ -463,3 +516,97 @@ class OrderView(ttk.Frame):
         self._render_categories()
         self._render_menus()
         self._render_order()
+
+
+class OptionDialog(tk.Toplevel):
+    """메뉴 옵션 선택 창. result = (옵션 id 목록, 수량, 요청사항) 또는 취소 시 None."""
+
+    def __init__(self, parent, pos, menu_id: int):
+        super().__init__(parent)
+        self.pos = pos
+        self.menu = pos.menu.get(menu_id)
+        self.result = None
+        self.title(f"{self.menu['name']} 옵션")
+        self.transient(parent.winfo_toplevel())
+        self.resizable(False, False)
+        body = ttk.Frame(self, padding=14)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=f"{self.menu['name']}  {self.menu['price']:,}원", font=font(13, True)).pack(
+            anchor="w")
+        self.group_vars: dict[str, tk.IntVar] = {}
+        self.check_vars: dict[int, tk.IntVar] = {}
+        self.options = {o["id"]: o for o in pos.menu.options(menu_id)}
+        groups: dict[str, list] = {}
+        singles = []
+        for o in self.options.values():
+            (groups.setdefault(o["group_name"], []) if o["group_name"] else singles).append(o)
+        for g, opts in groups.items():
+            box = ttk.LabelFrame(body, text=f" {g} (하나 선택) ", padding=6)
+            box.pack(fill="x", pady=(8, 0))
+            var = tk.IntVar(value=0)
+            self.group_vars[g] = var
+            ttk.Radiobutton(box, text="선택 안 함", value=0, variable=var,
+                            command=self._update).pack(side="left", padx=4)
+            for o in opts:
+                ttk.Radiobutton(box, text=self._label(o), value=o["id"], variable=var,
+                                command=self._update).pack(side="left", padx=4)
+        if singles:
+            box = ttk.LabelFrame(body, text=" 추가 선택 ", padding=6)
+            box.pack(fill="x", pady=(8, 0))
+            for o in singles:
+                var = tk.IntVar(value=0)
+                self.check_vars[o["id"]] = var
+                avail = pos.menu.available_qty(menu_id, [o["id"]])
+                cb = ttk.Checkbutton(box, text=self._label(o) + (" (재고 없음)" if avail <= 0 else ""),
+                                     variable=var, command=self._update)
+                if avail <= 0:
+                    cb.state(["disabled"])
+                cb.pack(anchor="w")
+        row = ttk.Frame(body)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Label(row, text="수량").pack(side="left")
+        self.qty = tk.StringVar(value="1")
+        ttk.Spinbox(row, from_=1, to=config.MAX_ITEM_QTY, textvariable=self.qty, width=5,
+                    command=self._update).pack(side="left", padx=6)
+        self.qty.trace_add("write", lambda *a: self._update())
+        ttk.Label(row, text="요청사항").pack(side="left", padx=(12, 0))
+        self.memo = tk.StringVar()
+        ttk.Entry(row, textvariable=self.memo, width=22).pack(side="left", padx=6)
+        self.total_lbl = tk.Label(body, text="", font=font(12, True), fg=COLORS["primary"])
+        self.total_lbl.pack(anchor="e", pady=(10, 0))
+        btns = ttk.Frame(body)
+        btns.pack(pady=(8, 0))
+        ttk.Button(btns, text="담기", style="Accent.TButton", command=self._ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="취소", command=self.destroy).pack(side="left", padx=4)
+        self.bind("<Return>", lambda e: self._ok())
+        self.bind("<Escape>", lambda e: self.destroy())
+        self._update()
+        center(self, parent)
+        self.grab_set()
+        self.wait_window()
+
+    @staticmethod
+    def _label(o) -> str:
+        return f"{o['name']} (+{o['price']:,})" if o["price"] else o["name"]
+
+    def _selected(self) -> list[int]:
+        ids = [v.get() for v in self.group_vars.values() if v.get()]
+        ids += [oid for oid, v in self.check_vars.items() if v.get()]
+        return ids
+
+    def _update(self):
+        try:
+            qty = max(1, int(self.qty.get() or 1))
+        except ValueError:
+            qty = 1
+        unit = self.menu["price"] + sum(self.options[i]["price"] for i in self._selected())
+        self.total_lbl.configure(text=f"{unit:,}원 × {qty} = {unit * qty:,}원")
+
+    def _ok(self):
+        try:
+            qty = int(self.qty.get())
+        except ValueError:
+            messagebox.showwarning("입력 오류", "수량은 숫자로 입력하세요.", parent=self)
+            return
+        self.result = (self._selected(), qty, self.memo.get())
+        self.destroy()

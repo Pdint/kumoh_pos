@@ -42,6 +42,7 @@ class StatsView(ttk.Frame):
         self._build_hourly()
         self._build_methods()
         self._build_times()
+        self._build_compare()
 
     # ---------------------------------------------------------------- 기간
     def set_period(self, kind):
@@ -66,6 +67,7 @@ class StatsView(ttk.Frame):
         cards = ttk.Frame(tab)
         cards.pack(fill="x")
         self.cards = {}
+        self.card_deltas = {}
         spec = [("gross_sales", "총 결제액"), ("refund_amount", "환불액"), ("net_sales", "순매출"),
                 ("order_count", "판매 건수"), ("avg_ticket", "평균 객단가"), ("discount", "할인 합계"),
                 ("cost", "원가 합계"), ("profit", "순이익"), ("cancel_count", "주문 취소")]
@@ -78,6 +80,9 @@ class StatsView(ttk.Frame):
                          fg=COLORS["primary"] if key in ("net_sales", "profit") else "#111827")
             v.pack(anchor="w")
             self.cards[key] = v
+            d = tk.Label(card, text="", bg="white", font=font(8), fg=COLORS["muted"])
+            d.pack(anchor="w")
+            self.card_deltas[key] = d
         head = ttk.Frame(tab)
         head.pack(fill="x", pady=(10, 2))
         ttk.Label(head, text="매출 추이", font=font(11, True)).pack(side="left")
@@ -160,6 +165,51 @@ class StatsView(ttk.Frame):
                                          ("avg", "평균 조리 시간", 120)], height=14,
                                    anchor_right=("count", "avg"))
 
+    # ---------------------------------------------------------------- 기간 비교
+    def _build_compare(self):
+        tab = ttk.Frame(self.nb, padding=8)
+        self.nb.add(tab, text="기간 비교")
+        self.compare_lbl = ttk.Label(tab, text="", font=font(11, True))
+        self.compare_lbl.pack(anchor="w")
+        ttk.Label(tab, text="※ 비교 기간: 한 달 전체 → 전월, 한 해 전체 → 전년, 월 초~오늘 → 지난달 같은 날짜, "
+                            "그 외 → 같은 길이의 바로 전 기간", foreground=COLORS["muted"]).pack(anchor="w")
+        f1 = ttk.Frame(tab)
+        f1.pack(fill="x", pady=(6, 0))
+        self.cmp_tree = make_tree(f1, [("label", "항목", 120), ("cur", "선택 기간", 120),
+                                       ("prev", "비교 기간", 120), ("diff", "증감", 120),
+                                       ("rate", "증감률", 80)], height=7,
+                                  anchor_right=("cur", "prev", "diff", "rate"))
+        self.cmp_tree.tag_configure("up", foreground=COLORS["ok"])
+        self.cmp_tree.tag_configure("down", foreground=COLORS["danger"])
+        ttk.Label(tab, text="메뉴별 증감 (매출 증감 순)", font=font(11, True)).pack(anchor="w", pady=(12, 0))
+        self.cmp_menu_tree = make_tree(tab, [
+            ("name", "메뉴", 120), ("qty", "판매수량", 80), ("pqty", "비교 수량", 80),
+            ("dqty", "수량 증감", 80), ("rev", "매출", 100), ("prev", "비교 매출", 100),
+            ("drev", "매출 증감", 100)], height=10,
+            anchor_right=("qty", "pqty", "dqty", "rev", "prev", "drev"))
+        self.cmp_menu_tree.tag_configure("up", foreground=COLORS["ok"])
+        self.cmp_menu_tree.tag_configure("down", foreground=COLORS["danger"])
+
+    def _render_compare(self, comp):
+        self.compare_lbl.configure(text=f"선택 기간 {comp['start']} ~ {comp['end']}   vs   "
+                                        f"비교 기간 {comp['prev_start']} ~ {comp['prev_end']}")
+        count_keys = ("order_count",)
+        rows, tags = [], []
+        for m in comp["metrics"]:
+            fmt = (lambda v: f"{v:,}건") if m["key"] in count_keys else (lambda v: f"{v:,}원")
+            rate = f"{m['rate']:+.1f}%" if m["rate"] is not None else "-"
+            rows.append((m["label"], fmt(m["current"]), fmt(m["previous"]),
+                         ("+" if m["diff"] > 0 else "") + fmt(m["diff"]), rate))
+            bad_up = m["key"] in ("refund_amount", "cost", "discount")
+            tags.append("" if not m["diff"] else ("up" if (m["diff"] > 0) != bad_up else "down"))
+        fill_tree(self.cmp_tree, rows, tags=tags)
+        fill_tree(self.cmp_menu_tree, [
+            (d["name"], d["qty"], d["prev_qty"], f"{d['qty_diff']:+,}", f"{d['revenue']:,}",
+             f"{d['prev_revenue']:,}", f"{d['revenue_diff']:+,}") for d in comp["menus"]],
+            tags=["up" if d["revenue_diff"] > 0 else ("down" if d["revenue_diff"] < 0 else "")
+                  for d in comp["menus"]])
+        self.last_compare = comp
+
     # ---------------------------------------------------------------- 갱신
     def refresh(self):
         s, e = self.range
@@ -170,6 +220,18 @@ class StatsView(ttk.Frame):
         for key, lbl in self.cards.items():
             v = summary[key]
             lbl.configure(text=f"{v:,}건" if key in ("order_count", "cancel_count") else won(v))
+        comp = self.pos.stats.compare(s, e)
+        by_key = {m["key"]: m for m in comp["metrics"]}
+        for key, lbl in self.card_deltas.items():
+            m = by_key.get(key)
+            if not m:
+                lbl.configure(text="")
+                continue
+            good = m["diff"] >= 0 if key not in ("refund_amount", "cost", "discount") else m["diff"] <= 0
+            rate = f"{m['rate']:+.1f}%" if m["rate"] is not None else "신규"
+            lbl.configure(text=f"비교 기간 대비 {rate}" if m["diff"] else "비교 기간과 동일",
+                          fg=COLORS["ok"] if good else COLORS["danger"])
+        self._render_compare(comp)
 
         unit = {v: k for k, v in GROUP_UNITS.items()}[self.unit_var.get()]
         trend = self.pos.stats.trend(s, e, unit)
@@ -245,5 +307,11 @@ class StatsView(ttk.Frame):
         rows += [[m["label"], m["count"], m["amount"], round(m["ratio"], 1)] for m in self.last["methods"]]
         rows += [[], ["[주문유형]", "건수", "매출"]]
         rows += [[t["label"], t["count"], t["sales"]] for t in self.last["types"]]
+        comp = getattr(self, "last_compare", None)
+        if comp:
+            rows += [[], [f"[기간 비교] {comp['prev_start']}~{comp['prev_end']} 대비", "선택 기간",
+                          "비교 기간", "증감", "증감률(%)"]]
+            rows += [[m["label"], m["current"], m["previous"], m["diff"],
+                      round(m["rate"], 1) if m["rate"] is not None else ""] for m in comp["metrics"]]
         path = self.pos.reports.export_csv(f"stats_{s}_{e}.csv", ["항목", "값"], rows)
         messagebox.showinfo("내보내기", f"저장되었습니다.\n{path}", parent=self)

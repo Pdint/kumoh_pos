@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS recipes (
     qty            REAL NOT NULL,
     PRIMARY KEY (menu_id, ingredient_id)
 );
+CREATE TABLE IF NOT EXISTS menu_options (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    menu_id        INTEGER NOT NULL REFERENCES menus(id) ON DELETE CASCADE,
+    group_name     TEXT NOT NULL DEFAULT '',
+    name           TEXT NOT NULL,
+    price          INTEGER NOT NULL DEFAULT 0,
+    ingredient_id  INTEGER REFERENCES ingredients(id) ON DELETE SET NULL,
+    ingredient_qty REAL NOT NULL DEFAULT 0,
+    sort           INTEGER NOT NULL DEFAULT 0,
+    active         INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS stock_logs (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     ingredient_id  INTEGER NOT NULL,
@@ -142,6 +153,16 @@ CREATE TABLE IF NOT EXISTS payments (
     refunded_at  TEXT,
     memo         TEXT
 );
+CREATE TABLE IF NOT EXISTS refunds (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id  INTEGER NOT NULL REFERENCES orders(id),
+    method    TEXT NOT NULL,
+    amount    INTEGER NOT NULL,
+    reason    TEXT NOT NULL,
+    detail    TEXT,
+    partial   INTEGER NOT NULL DEFAULT 0,
+    at        TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS staff (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
@@ -190,7 +211,19 @@ CREATE INDEX IF NOT EXISTS idx_orders_paid_at ON orders(paid_at);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE INDEX IF NOT EXISTS idx_items_order ON order_items(order_id);
 CREATE INDEX IF NOT EXISTS idx_payments_order ON payments(order_id);
+CREATE INDEX IF NOT EXISTS idx_refunds_at ON refunds(at);
 """
+
+# 이전 버전 DB에 없는 컬럼: (테이블, 컬럼, 정의)
+MIGRATIONS = [
+    ("order_items", "option_ids", "TEXT NOT NULL DEFAULT ''"),
+    ("order_items", "options", "TEXT NOT NULL DEFAULT ''"),
+    ("order_items", "memo", "TEXT NOT NULL DEFAULT ''"),
+    ("order_items", "refunded_qty", "INTEGER NOT NULL DEFAULT 0"),
+    ("order_items", "ticket_qty", "INTEGER NOT NULL DEFAULT 0"),
+    ("orders", "refunded_amount", "INTEGER NOT NULL DEFAULT 0"),
+    ("orders", "points_revoked", "INTEGER NOT NULL DEFAULT 0"),
+]
 
 
 def hash_password(password: str, salt: str | None = None) -> str:
@@ -216,9 +249,25 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._now = now or datetime.now
         self.mode = "USER"
-        self.conn.executescript(SCHEMA)
+        self.migrate()
         if not self.get_setting("admin_password"):
             self.set_setting("admin_password", hash_password(config.DEFAULT_ADMIN_PASSWORD))
+
+    def migrate(self) -> None:
+        """스키마 생성 + 이전 버전 DB에 새 컬럼 추가 (복원한 백업에도 적용)."""
+        self.conn.executescript(SCHEMA)
+        for table, column, ddl in MIGRATIONS:
+            cols = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+        # 이전 버전의 전체 환불 내역을 환불 테이블로 옮긴다.
+        if not self.conn.execute("SELECT 1 FROM refunds LIMIT 1").fetchone():
+            self.conn.execute(
+                "INSERT INTO refunds(order_id, method, amount, reason, partial, at) "
+                "SELECT p.order_id, p.method, p.amount, COALESCE(o.cancel_reason, '환불'), 0, "
+                "p.refunded_at FROM payments p JOIN orders o ON o.id=p.order_id "
+                "WHERE p.refunded_at IS NOT NULL")
+        self.conn.commit()
 
     # ---- 시간 ----
     def now(self) -> datetime:
@@ -359,3 +408,34 @@ def seed_initial_data(db: Database) -> None:
         ("박알바", "PART", 10_320, 0, "010-5555-6666"),
     )
     db.commit()
+
+
+def seed_default_options(db: Database) -> None:
+    """기본 메뉴 옵션. 이전 버전 DB에도 한 번만 넣는다."""
+    if db.get_setting("options_seeded"):
+        return
+    menu = {r["name"]: r["id"] for r in db.query("SELECT id, name FROM menus WHERE active=1")}
+    ing = {r["name"]: r["id"] for r in db.query("SELECT id, name FROM ingredients")}
+    spicy = [("맵기", "순한맛", 0), ("맵기", "보통맛", 0), ("맵기", "매운맛", 0)]
+    options = {
+        "떡볶이": spicy + [("", "치즈 추가", 500, "치즈", 1), ("", "어묵 추가", 1000, "어묵", 2)],
+        "치즈떡볶이": spicy + [("", "치즈 추가", 500, "치즈", 1)],
+        "라볶이": spicy + [("", "라면사리 추가", 1000, "라면사리", 1)],
+        "라면": [("", "곱빼기", 1000, "라면사리", 1), ("", "계란 추가", 500, "계란", 1),
+               ("", "치즈 추가", 500, "치즈", 1)],
+        "치즈라면": [("", "곱빼기", 1000, "라면사리", 1), ("", "계란 추가", 500, "계란", 1)],
+        "쫄면": [("", "곱빼기", 1500, "쫄면사리", 1), ("맵기", "덜 맵게", 0), ("맵기", "보통", 0)],
+        "순대": [("부위", "순대만", 0), ("부위", "내장 섞어서", 0)],
+    }
+    for menu_name, opts in options.items():
+        if menu_name not in menu:
+            continue
+        for sort, o in enumerate(opts):
+            group, name, price = o[0], o[1], o[2]
+            ing_id = ing.get(o[3]) if len(o) > 3 else None
+            ing_qty = o[4] if len(o) > 3 and ing_id else 0
+            db.execute(
+                "INSERT INTO menu_options(menu_id, group_name, name, price, ingredient_id, "
+                "ingredient_qty, sort) VALUES(?,?,?,?,?,?,?)",
+                (menu[menu_name], group, name, price, ing_id, ing_qty, sort))
+    db.set_setting("options_seeded", "1")

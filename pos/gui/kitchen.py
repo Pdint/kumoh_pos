@@ -23,9 +23,9 @@ class KitchenView(ttk.Frame):
         ttk.Label(head, text="※ 15분 이상 대기 항목은 빨간색", foreground=COLORS["danger"]).pack(
             side="right")
         self.tree = make_tree(self, [
-            ("no", "주문번호", 70), ("where", "테이블/포장", 100), ("name", "메뉴", 160),
-            ("qty", "수량", 50), ("status", "상태", 70), ("ordered", "주문 시각", 90),
-            ("wait", "경과", 70)], height=18, anchor_right=("qty", "wait"))
+            ("no", "주문번호", 70), ("where", "테이블/포장", 100), ("name", "메뉴", 140),
+            ("opt", "옵션 / 요청사항", 240), ("qty", "수량", 50), ("status", "상태", 70),
+            ("ordered", "주문 시각", 80), ("wait", "경과", 60)], height=18, anchor_right=("qty", "wait"))
         self.tree.configure(selectmode="extended")
         self.tree.tag_configure("cooking", background="#fff4e5")
         self.tree.bind("<Double-1>", lambda e: self.complete())
@@ -51,7 +51,9 @@ class KitchenView(ttk.Frame):
             if wait >= 15:
                 tags.append("warn")
             self.tree.insert("", "end", iid=str(it["id"]), tags=tags, values=(
-                f"#{it['order_no']:03d}", where, it["name"], it["qty"], STATUS[it["status"]],
+                f"#{it['order_no']:03d}", where, it["name"],
+                " / ".join(x for x in (it["options"], f"요청: {it['memo']}" if it["memo"] else "") if x),
+                it["qty"], STATUS[it["status"]],
                 it["ordered_at"][11:16], f"{wait}분"))
         for iid in sel & set(self.tree.get_children()):
             self.tree.selection_add(iid)

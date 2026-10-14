@@ -135,6 +135,17 @@ class App(tk.Tk):
         self._update_low_stock_memory()
         self._update_alert()
 
+    def after_restore(self):
+        """DB 복원 후 화면 상태를 초기화한다."""
+        ov = self.order_view
+        ov.current_order_id = None
+        ov.current_table_id = None
+        ov.takeout_mode = False
+        ov.table_buttons = {}
+        self.alerted_reservations.clear()
+        self.warned_ingredients.clear()
+        self.refresh_all()
+
     def after_payment(self, order_id: int):
         self.refresh_all()
 

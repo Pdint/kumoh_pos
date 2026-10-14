@@ -9,3 +9,4 @@ backups/
 .venv/
 build/
 dist/
+prints/

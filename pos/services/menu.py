@@ -126,41 +126,125 @@ class MenuService(Service):
                 (menu_id, ing_id, qty),
             )
 
-    def available_qty(self, menu_id: int) -> int:
+    # ------------------------------------------------------------ 옵션
+    def options(self, menu_id: int, include_inactive: bool = False):
+        sql = ("SELECT o.*, i.name AS ingredient_name, i.unit AS ingredient_unit "
+               "FROM menu_options o LEFT JOIN ingredients i ON i.id=o.ingredient_id "
+               "WHERE o.menu_id=?")
+        if not include_inactive:
+            sql += " AND o.active=1"
+        return self.db.query(sql + " ORDER BY o.sort, o.id", (menu_id,))
+
+    def add_option(self, menu_id: int, name: str, price: int = 0, group_name: str = "",
+                   ingredient_id: int | None = None, ingredient_qty: float = 0) -> int:
+        name, group_name = name.strip(), group_name.strip()
+        if not name:
+            raise PosError("옵션 이름을 입력하세요.")
+        if price < 0 or price > config.MAX_OPTION_PRICE or price % 100:
+            raise PosError(f"옵션 추가금은 0~{config.MAX_OPTION_PRICE:,}원, 100원 단위입니다.")
+        if ingredient_id is not None and ingredient_qty <= 0:
+            raise PosError("옵션 재료 사용량은 0보다 커야 합니다.")
+        if self.db.query_one("SELECT 1 FROM menu_options WHERE menu_id=? AND name=? AND active=1",
+                             (menu_id, name)):
+            raise PosError("이미 있는 옵션 이름입니다.")
+        sort = (self.db.scalar("SELECT MAX(sort) FROM menu_options WHERE menu_id=?",
+                               (menu_id,)) or 0) + 1
+        cur = self.db.execute(
+            "INSERT INTO menu_options(menu_id, group_name, name, price, ingredient_id, "
+            "ingredient_qty, sort) VALUES(?,?,?,?,?,?,?)",
+            (menu_id, group_name, name, price, ingredient_id,
+             ingredient_qty if ingredient_id else 0, sort))
+        self.db.log("옵션 추가", f"메뉴 {menu_id} {name} +{price}")
+        self.db.commit()
+        return cur.lastrowid
+
+    def delete_option(self, option_id: int) -> None:
+        """판매 이력 보존을 위해 비활성화한다."""
+        self.db.execute("UPDATE menu_options SET active=0 WHERE id=?", (option_id,))
+        self.db.log("옵션 삭제", str(option_id))
+        self.db.commit()
+
+    def resolve_options(self, menu_id: int, option_ids) -> tuple[list, int, str]:
+        """선택한 옵션을 검증하고 (옵션 행 목록, 추가금 합계, 표시 문자열)을 반환한다.
+
+        같은 그룹(예: 맵기)에서는 하나만 고를 수 있다.
+        """
+        option_ids = sorted({int(i) for i in option_ids})
+        if not option_ids:
+            return [], 0, ""
+        valid = {o["id"]: o for o in self.options(menu_id)}
+        rows = []
+        groups = set()
+        for oid in option_ids:
+            if oid not in valid:
+                raise PosError("선택할 수 없는 옵션입니다.")
+            o = valid[oid]
+            if o["group_name"]:
+                if o["group_name"] in groups:
+                    raise PosError(f"'{o['group_name']}'은(는) 하나만 선택할 수 있습니다.")
+                groups.add(o["group_name"])
+            rows.append(o)
+        rows.sort(key=lambda o: (o["sort"], o["id"]))
+        label = ", ".join(o["name"] for o in rows)
+        return rows, sum(o["price"] for o in rows), label
+
+    # ------------------------------------------------------------ 재고 계산
+    def _requirements(self, menu_id: int, option_ids=()) -> dict[int, float]:
+        """메뉴 1개(+옵션)를 만드는 데 필요한 재료량 {재료 id: 수량}."""
+        need: dict[int, float] = {}
+        for r in self.db.query("SELECT ingredient_id, qty FROM recipes WHERE menu_id=?", (menu_id,)):
+            need[r["ingredient_id"]] = need.get(r["ingredient_id"], 0) + r["qty"]
+        ids = [int(i) for i in option_ids]
+        if ids:
+            marks = ",".join("?" * len(ids))
+            for o in self.db.query(
+                    f"SELECT ingredient_id, ingredient_qty FROM menu_options WHERE id IN ({marks}) "
+                    "AND ingredient_id IS NOT NULL", ids):
+                need[o["ingredient_id"]] = need.get(o["ingredient_id"], 0) + o["ingredient_qty"]
+        return need
+
+    def available_qty(self, menu_id: int, option_ids=()) -> int:
         """현재 재고로 만들 수 있는 최대 수량. 레시피가 없으면 무제한(9999)."""
-        rows = self.db.query(
-            "SELECT r.qty, i.stock FROM recipes r JOIN ingredients i ON i.id=r.ingredient_id "
-            "WHERE r.menu_id=?",
-            (menu_id,),
-        )
-        if not rows:
+        need = self._requirements(menu_id, option_ids)
+        if not need:
             return 9999
-        return max(0, min(math.floor(r["stock"] / r["qty"] + 1e-9) for r in rows))
+        stock = {r["id"]: r["stock"] for r in self.db.query("SELECT id, stock FROM ingredients")}
+        return max(0, min(math.floor(stock.get(i, 0) / q + 1e-9) for i, q in need.items()))
 
     def is_soldout(self, menu_id: int) -> bool:
         menu = self.get(menu_id)
         return bool(menu["manual_soldout"]) or self.available_qty(menu_id) <= 0
 
-    def consume(self, menu_id: int, qty: int, reason: str) -> list[str]:
-        """주문 수량만큼 재료를 차감(qty<0 이면 복구)하고, 재고 경고 메시지를 반환한다.
+    def consume(self, menu_id: int, qty: int, reason: str, option_ids=()) -> list[str]:
+        """주문 수량만큼 재료(옵션 재료 포함)를 차감(qty<0 이면 복구)하고 재고 경고를 반환한다.
 
         커밋은 호출자가 담당한다.
         """
-        if qty > 0 and self.available_qty(menu_id) < qty:
-            menu = self.get(menu_id)
-            raise PosError(
-                f"'{menu['name']}' 재고가 부족합니다. (주문 가능 {self.available_qty(menu_id)}개)"
-            )
+        if qty > 0:
+            avail = self.available_qty(menu_id, option_ids)
+            if avail < qty:
+                menu = self.get(menu_id)
+                raise PosError(f"'{menu['name']}' 재고가 부족합니다. (주문 가능 {avail}개)")
         now = self.db.now_str()
-        for r in self.db.query("SELECT ingredient_id, qty FROM recipes WHERE menu_id=?", (menu_id,)):
-            delta = -r["qty"] * qty
-            self.db.execute("UPDATE ingredients SET stock=stock+? WHERE id=?",
-                            (delta, r["ingredient_id"]))
+        need = self._requirements(menu_id, option_ids)
+        for ing_id, per in need.items():
+            delta = -per * qty
+            self.db.execute("UPDATE ingredients SET stock=stock+? WHERE id=?", (delta, ing_id))
             self.db.execute(
                 "INSERT INTO stock_logs(ingredient_id, delta, reason, at) VALUES(?,?,?,?)",
-                (r["ingredient_id"], delta, reason, now),
+                (ing_id, delta, reason, now),
             )
-        return self.low_stock_warnings(menu_id) if qty > 0 else []
+        if qty <= 0:
+            return []
+        return [w for w in self.low_stock_warnings() if any(
+            w.startswith(f"[재고 경고] {name} ") for name in self._names(need))]
+
+    def _names(self, need: dict[int, float]) -> list[str]:
+        if not need:
+            return []
+        marks = ",".join("?" * len(need))
+        return [r["name"] for r in self.db.query(
+            f"SELECT name FROM ingredients WHERE id IN ({marks})", list(need))]
 
     def low_stock_warnings(self, menu_id: int | None = None) -> list[str]:
         sql = "SELECT i.* FROM ingredients i WHERE i.stock <= i.threshold"

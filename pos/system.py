@@ -4,13 +4,14 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable
 
-from .db import Database, seed_initial_data
+from .db import Database, seed_default_options, seed_initial_data
 from .services.auth import AuthService
 from .services.discount import DiscountService
 from .services.member import MemberService
 from .services.menu import MenuService
 from .services.order import OrderService
 from .services.payment import PaymentService
+from .services.printer import PrinterService
 from .services.report import ReportService
 from .services.reservation import ReservationService
 from .services.staff import StaffService
@@ -24,6 +25,7 @@ class PosSystem:
         self.db = Database(db_path, now=now)
         if seed:
             seed_initial_data(self.db)
+            seed_default_options(self.db)
         self.menu = MenuService(self.db)
         self.tables = TableService(self.db)
         self.discount = DiscountService(self.db)
@@ -35,6 +37,7 @@ class PosSystem:
         self.stats = StatsService(self.db)
         self.reports = ReportService(self.db, self.discount, self.stats, out_dir)
         self.auth = AuthService(self.db)
+        self.printer = PrinterService(self.db, out_dir)
 
     def close(self) -> None:
         self.db.close()

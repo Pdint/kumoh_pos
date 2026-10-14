@@ -191,12 +191,17 @@ def center(win: tk.Toplevel, parent: tk.Misc) -> None:
 
 
 class TextDialog(tk.Toplevel):
-    """영수증/보고서 표시용 고정폭 텍스트 창."""
+    """영수증/보고서 표시용 고정폭 텍스트 창.
 
-    def __init__(self, parent: tk.Misc, title: str, text: str, saved_path: str | None = None):
+    printer와 print_name을 주면 '인쇄' 버튼이 생긴다. note는 하단 안내 문구.
+    """
+
+    def __init__(self, parent: tk.Misc, title: str, text: str, saved_path: str | None = None,
+                 note: str | None = None, printer=None, print_name: str | None = None):
         super().__init__(parent)
         self.title(title)
         self.transient(parent.winfo_toplevel())
+        self.text, self.printer, self.print_name = text, printer, print_name
         txt = tk.Text(self, width=48, height=min(40, text.count("\n") + 3), font=mono(10),
                       padx=12, pady=10, bg="#fffef7")
         txt.insert("1.0", text)
@@ -204,10 +209,18 @@ class TextDialog(tk.Toplevel):
         txt.pack(fill="both", expand=True)
         bar = ttk.Frame(self, padding=6)
         bar.pack(fill="x")
-        if saved_path:
-            ttk.Label(bar, text=f"저장됨: {saved_path}", foreground=COLORS["muted"]).pack(side="left")
+        msg = note or (f"저장됨: {saved_path}" if saved_path else "")
+        self.note = ttk.Label(bar, text=msg, foreground=COLORS["muted"], wraplength=360,
+                              justify="left")
+        self.note.pack(side="left")
         ttk.Button(bar, text="닫기", command=self.destroy).pack(side="right")
+        if printer is not None and print_name:
+            ttk.Button(bar, text="인쇄", command=self._print).pack(side="right", padx=4)
         center(self, parent)
+
+    def _print(self):
+        result = self.printer.print_text(self.text, self.print_name)
+        self.note.configure(text=result["message"])
 
 
 class BarChart(tk.Canvas):

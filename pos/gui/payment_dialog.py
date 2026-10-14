@@ -142,6 +142,11 @@ class PaymentDialog(tk.Toplevel):
             ttk.Radiobutton(self.method_box, text=label, value=key, variable=self.method,
                             command=self._on_method).pack(side="left", padx=6)
 
+        self.transfer_box = ttk.LabelFrame(parent, text=" 계좌이체 ", padding=8)
+        ttk.Label(self.transfer_box, text="아래 계좌로 입금받은 뒤 '결제하기'를 누르세요.").pack(anchor="w")
+        tk.Label(self.transfer_box, text=config.STORE_BANK_ACCOUNT, font=font(12, True),
+                 fg=COLORS["primary"]).pack(anchor="w", pady=(4, 0))
+
         self.cash_box = ttk.LabelFrame(parent, text=" 현금 ", padding=8)
         ttk.Label(self.cash_box, text="받은 금액").grid(row=0, column=0, sticky="w")
         self.recv_var = tk.StringVar()
@@ -264,10 +269,15 @@ class PaymentDialog(tk.Toplevel):
                 self.amount_var.set(str(self.calc["remaining"]))
 
     def _on_method(self):
-        if self.method.get() == "CASH":
+        method = self.method.get()
+        if method == "CASH":
             self.cash_box.pack(fill="x", pady=6, after=self.method_box)
         else:
             self.cash_box.pack_forget()
+        if method == "TRANSFER":
+            self.transfer_box.pack(fill="x", pady=6, after=self.method_box)
+        else:
+            self.transfer_box.pack_forget()
 
     def _amount(self) -> int:
         try:
@@ -405,7 +415,9 @@ class PaymentDialog(tk.Toplevel):
         def show(detailed):
             win.destroy()
             path = self.pos.reports.save_receipt(self.order_id, detailed)
-            TextDialog(self.master, "영수증", self.pos.reports.receipt(self.order_id, detailed), path)
+            TextDialog(self.master, "영수증", self.pos.reports.receipt(self.order_id, detailed), path,
+                       printer=self.pos.printer,
+                       print_name=f"receipt_{self.order_id}_{'full' if detailed else 'total'}")
         ttk.Button(bar, text="상세 영수증\n(전체 메뉴)", command=lambda: show(True)).pack(side="left",
                                                                                 padx=4)
         ttk.Button(bar, text="간이 영수증\n(총액만)", command=lambda: show(False)).pack(side="left",

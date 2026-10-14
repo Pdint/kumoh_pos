@@ -1,6 +1,7 @@
 """관리자 모드 화면들: 메뉴 · 재고 · 테이블 · 할인/쿠폰 · 직원/급여 · 주문내역(환불) · 일일마감 · 설정."""
 from __future__ import annotations
 
+import os
 import tkinter as tk
 from datetime import date
 from tkinter import messagebox, simpledialog, ttk
@@ -29,12 +30,14 @@ class MenuAdminView(ttk.Frame):
         self.app = app
         self.pos = app.pos
         toolbar(self, [("+ 메뉴 추가", self.add), ("수정", self.edit), ("판매 중지(삭제)", self.delete),
-                       ("품절 설정/해제", self.toggle_soldout), ("분류 추가", self.add_category),
+                       ("품절 설정/해제", self.toggle_soldout), ("옵션 관리", self.manage_options),
+                       ("분류 추가", self.add_category),
                        ("분류 삭제", self.delete_category)])
         self.tree = make_tree(self, [
             ("cat", "분류", 80), ("name", "메뉴", 110), ("price", "판매가", 70), ("cost", "원가", 70),
             ("margin", "이익률", 60), ("dc", "메뉴할인", 60), ("avail", "주문가능", 70),
-            ("state", "상태", 80), ("recipe", "레시피(재료 소모량)", 300)], height=20,
+            ("state", "상태", 80), ("opts", "옵션", 70), ("recipe", "레시피(재료 소모량)", 260)],
+            height=20,
             anchor_right=("price", "cost", "margin", "dc", "avail"))
         self.tree.bind("<Double-1>", lambda e: self.edit())
 
@@ -47,7 +50,8 @@ class MenuAdminView(ttk.Frame):
             rows.append((m["category"], m["name"], f"{m['price']:,}", f"{m['cost']:,}",
                          f"{(m['price'] - m['cost']) / m['price'] * 100:.0f}%",
                          f"{m['discount_rate']}%" if m["discount_rate"] else "-",
-                         "∞" if avail >= 9999 else avail, state, recipe))
+                         "∞" if avail >= 9999 else avail, state,
+                         f"{len(self.pos.menu.options(m['id']))}개", recipe))
             ids.append(m["id"])
             tags.append("warn" if state != "판매중" else "")
         fill_tree(self.tree, rows, ids, tags)
@@ -76,6 +80,14 @@ class MenuAdminView(ttk.Frame):
             run_safe(self, self.pos.menu.set_manual_soldout, mid, not m["manual_soldout"])
             self.app.refresh_all()
 
+    def manage_options(self):
+        mid = selected_id(self.tree)
+        if mid is None:
+            messagebox.showinfo("알림", "옵션을 관리할 메뉴를 선택하세요.", parent=self)
+            return
+        OptionAdminDialog(self, self.pos, mid)
+        self.app.refresh_all()
+
     def add_category(self):
         name = simpledialog.askstring("분류 추가", "분류 이름", parent=self)
         if name:
@@ -89,6 +101,65 @@ class MenuAdminView(ttk.Frame):
             cid = next(c["id"] for c in cats if c["name"] == data["cat"])
             run_safe(self, self.pos.menu.delete_category, cid)
             self.app.refresh_all()
+
+
+class OptionAdminDialog(tk.Toplevel):
+    """메뉴 옵션 관리: 그룹(하나만 선택) 또는 개별 선택 옵션, 추가금, 사용 재료."""
+
+    def __init__(self, parent, pos, menu_id: int):
+        super().__init__(parent)
+        self.pos, self.menu_id = pos, menu_id
+        menu = pos.menu.get(menu_id)
+        self.title(f"옵션 관리 - {menu['name']}")
+        self.transient(parent.winfo_toplevel())
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="같은 그룹 이름(예: 맵기)의 옵션은 하나만 고를 수 있고, "
+                             "그룹이 비어 있으면 여러 개를 함께 고를 수 있습니다.",
+                  foreground=COLORS["muted"]).pack(anchor="w")
+        frame = ttk.Frame(body, height=220)
+        frame.pack(fill="both", expand=True, pady=6)
+        self.tree = make_tree(frame, [("group", "그룹", 80), ("name", "옵션", 120),
+                                      ("price", "추가금", 70), ("ing", "사용 재료", 150)],
+                              height=8, anchor_right=("price",))
+        bar = ttk.Frame(body)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="+ 옵션 추가", command=self.add).pack(side="left")
+        ttk.Button(bar, text="삭제", command=self.delete).pack(side="left", padx=4)
+        ttk.Button(bar, text="닫기", command=self.destroy).pack(side="right")
+        self.load()
+        center(self, parent)
+        self.grab_set()
+        self.wait_window()
+
+    def load(self):
+        opts = self.pos.menu.options(self.menu_id)
+        fill_tree(self.tree, [
+            (o["group_name"] or "-", o["name"], f"{o['price']:,}",
+             f"{o['ingredient_name']} {o['ingredient_qty']:g}{o['ingredient_unit']}"
+             if o["ingredient_name"] else "-") for o in opts], [o["id"] for o in opts])
+
+    def add(self):
+        ings = self.pos.menu.ingredients()
+        groups = sorted({o["group_name"] for o in self.pos.menu.options(self.menu_id) if o["group_name"]})
+        d = ask_form(self, "옵션 추가", [
+            ("group", f"그룹 (비우면 개별 선택{', 기존: ' + ', '.join(groups) if groups else ''})", "", None),
+            ("name", "옵션 이름", "", None), ("price", "추가금(원)", "0", None),
+            ("ing", "사용 재료 (없으면 비움)", "", [""] + [i["name"] for i in ings]),
+            ("qty", "재료 사용량", "1", None)], width=30)
+        if not d:
+            return
+        ing_id = next((i["id"] for i in ings if i["name"] == d["ing"]), None)
+        if run_safe(self, lambda: self.pos.menu.add_option(
+                self.menu_id, d["name"], int(d["price"] or 0), d["group"], ing_id,
+                float(d["qty"] or 0) if ing_id else 0)):
+            self.load()
+
+    def delete(self):
+        oid = selected_id(self.tree)
+        if oid and messagebox.askyesno("확인", "선택한 옵션을 삭제할까요?", parent=self):
+            self.pos.menu.delete_option(oid)
+            self.load()
 
 
 class MenuDialog(tk.Toplevel):
@@ -569,8 +640,9 @@ class OrderHistoryView(ttk.Frame):
         ttk.Combobox(bar, textvariable=self.status, values=["전체", *ORDER_STATUS.values()],
                      state="readonly", width=9).pack(side="left", padx=6)
         ttk.Button(bar, text="조회", command=self.refresh).pack(side="left")
-        ttk.Button(bar, text="결제 취소 / 환불", style="Danger.TButton", command=self.refund).pack(
+        ttk.Button(bar, text="전체 환불 / 결제 취소", style="Danger.TButton", command=self.refund).pack(
             side="right")
+        ttk.Button(bar, text="부분 환불", command=self.partial_refund).pack(side="right", padx=4)
         ttk.Button(bar, text="간이 영수증", command=lambda: self.receipt(False)).pack(side="right", padx=4)
         ttk.Button(bar, text="상세 영수증", command=lambda: self.receipt(True)).pack(side="right")
         self.tree = make_tree(self, [
@@ -596,8 +668,14 @@ class OrderHistoryView(ttk.Frame):
             total = o["total"] if o["locked"] else self.pos.discount.calculate(o["id"])["total"]
             where = "포장" if o["order_type"] == "TAKEOUT" else \
                 f"테이블 {self.pos.db.scalar('SELECT name FROM tables_ WHERE id=?', (o['table_id'],)) or ''}"
+            status = ORDER_STATUS[o["status"]]
+            reason = o["cancel_reason"] or ""
+            if o["status"] == "PAID" and o["refunded_amount"]:
+                status = "부분환불"
+                reason = f"-{o['refunded_amount']:,}원 " + "; ".join(
+                    r["reason"] for r in self.pos.payments.refunds(o["id"]))
             rows.append((o["order_no"], o["created_at"], where, items, f"{total:,}", methods or "-",
-                         ORDER_STATUS[o["status"]], o["cancel_reason"] or ""))
+                         status, reason))
             ids.append(o["id"])
             tags.append("refunded" if o["status"] in ("REFUNDED", "CANCELLED") else "")
         fill_tree(self.tree, rows, ids, tags)
@@ -607,7 +685,20 @@ class OrderHistoryView(ttk.Frame):
         if oid is None:
             return
         path = self.pos.reports.save_receipt(oid, detailed)
-        TextDialog(self, "영수증 재출력", self.pos.reports.receipt(oid, detailed), path)
+        TextDialog(self, "영수증 재출력", self.pos.reports.receipt(oid, detailed), path,
+                   printer=self.pos.printer,
+                   print_name=f"receipt_{oid}_{'full' if detailed else 'total'}")
+
+    def partial_refund(self):
+        oid = selected_id(self.tree)
+        if oid is None:
+            return
+        order = self.pos.orders.get(oid)
+        if order["status"] != "PAID":
+            messagebox.showinfo("알림", "결제 완료된 주문만 부분 환불할 수 있습니다.", parent=self)
+            return
+        PartialRefundDialog(self, self.pos, oid)
+        self.app.refresh_all()
 
     def refund(self):
         oid = selected_id(self.tree)
@@ -646,6 +737,94 @@ class OrderHistoryView(ttk.Frame):
         win.grab_set()
 
 
+class PartialRefundDialog(tk.Toplevel):
+    """메뉴·수량을 골라 일부만 환불한다."""
+
+    def __init__(self, parent, pos, order_id: int):
+        super().__init__(parent)
+        self.pos, self.order_id = pos, order_id
+        self.title("부분 환불")
+        self.transient(parent.winfo_toplevel())
+        body = ttk.Frame(self, padding=12)
+        body.pack(fill="both", expand=True)
+        order = pos.orders.get(order_id)
+        tk.Label(body, text=f"주문 #{order['order_no']} · 결제 {order['total']:,}원"
+                            + (f" · 기환불 {order['refunded_amount']:,}원" if order["refunded_amount"] else ""),
+                 font=font(11, True)).grid(row=0, column=0, columnspan=4, sticky="w")
+        self.vars: dict[int, tk.StringVar] = {}
+        r = 1
+        for it in pos.orders.items(order_id):
+            left = it["qty"] - it["refunded_qty"]
+            ttk.Label(body, text=pos.orders.item_label(it)).grid(row=r, column=0, sticky="w", pady=2)
+            ttk.Label(body, text=f"환불 가능 {left}/{it['qty']}").grid(row=r, column=1, padx=8)
+            v = tk.StringVar(value="0")
+            sp = ttk.Spinbox(body, from_=0, to=left, textvariable=v, width=4, command=self._update)
+            if not left:
+                sp.state(["disabled"])
+            sp.grid(row=r, column=2)
+            v.trace_add("write", lambda *a: self._update())
+            self.vars[it["id"]] = v
+            r += 1
+        avail = pos.payments.refundable_by_method(order_id)
+        self.methods = list(avail)
+        ttk.Label(body, text="환불 수단").grid(row=r, column=0, sticky="w", pady=(10, 0))
+        self.method = ttk.Combobox(body, state="readonly", width=24, values=[
+            f"{config.PAYMENT_METHODS[m]} (최대 {a:,}원)" for m, a in avail.items()])
+        if self.methods:
+            self.method.current(0)
+        self.method.grid(row=r, column=1, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(body, text="환불 사유").grid(row=r + 1, column=0, sticky="w", pady=4)
+        self.reason = tk.StringVar()
+        ttk.Entry(body, textvariable=self.reason, width=28).grid(row=r + 1, column=1, columnspan=3,
+                                                                  sticky="w")
+        self.restock = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="재료 재고 복구", variable=self.restock).grid(
+            row=r + 2, column=0, columnspan=2, sticky="w")
+        self.amount_lbl = tk.Label(body, text="", font=font(12, True), fg=COLORS["danger"])
+        self.amount_lbl.grid(row=r + 3, column=0, columnspan=4, sticky="e", pady=(8, 0))
+        ttk.Label(body, text="※ 주문 할인(시간대·쿠폰·포인트)은 금액 비율대로 나눠 환불합니다.\n"
+                             "※ 선택한 수단의 금액이 부족하면 나머지는 다른 결제수단으로 환불합니다.\n"
+                             "※ 남은 메뉴를 모두 고르면 전체 환불로 처리됩니다.",
+                  foreground=COLORS["muted"], justify="left").grid(
+            row=r + 4, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        btns = ttk.Frame(body)
+        btns.grid(row=r + 5, column=0, columnspan=4, pady=(10, 0))
+        ttk.Button(btns, text="환불 실행", style="Danger.TButton", command=self._ok).pack(side="left", padx=4)
+        ttk.Button(btns, text="닫기", command=self.destroy).pack(side="left", padx=4)
+        self._update()
+        center(self, parent)
+        self.grab_set()
+        self.wait_window()
+
+    def _qtys(self) -> dict[int, int]:
+        out = {}
+        for iid, v in self.vars.items():
+            try:
+                out[iid] = int(v.get() or 0)
+            except ValueError:
+                out[iid] = 0
+        return out
+
+    def _update(self):
+        qtys = self._qtys()
+        if not any(qtys.values()):
+            self.amount_lbl.configure(text="환불 금액 0원")
+            return
+        try:
+            amt = self.pos.payments.item_refund_amount(self.order_id, qtys)
+            self.amount_lbl.configure(text=f"환불 금액 {amt:,}원")
+        except Exception:
+            self.amount_lbl.configure(text="수량을 확인하세요")
+
+    def _ok(self):
+        method = self.methods[self.method.current()] if self.method.current() >= 0 else None
+        amt = run_safe(self, self.pos.payments.refund_items, self.order_id, self._qtys(),
+                       self.reason.get(), method, self.restock.get())
+        if amt is not None:
+            messagebox.showinfo("환불 완료", f"{amt:,}원을 환불 처리했습니다.", parent=self)
+            self.destroy()
+
+
 # ====================================================================== 일일 마감
 class ClosingView(ttk.Frame):
     def __init__(self, parent, app):
@@ -658,6 +837,7 @@ class ClosingView(ttk.Frame):
         ttk.Label(bar, text="영업일").pack(side="left")
         ttk.Entry(bar, textvariable=self.day, width=11).pack(side="left", padx=4)
         ttk.Button(bar, text="미리보기", command=self.preview).pack(side="left", padx=2)
+        ttk.Button(bar, text="인쇄", command=self.print_report).pack(side="left", padx=2)
         ttk.Button(bar, text="일일 마감 실행", style="Accent.TButton", command=self.close_day).pack(
             side="left", padx=6)
         self.state_lbl = ttk.Label(bar, text="", font=font(10, True))
@@ -678,6 +858,14 @@ class ClosingView(ttk.Frame):
                   [i for i, _ in enumerate(closings)])
         self._closings = closings
         self.preview()
+
+    def print_report(self):
+        text = self.text.get("1.0", "end").strip()
+        if not text:
+            return
+        result = self.pos.printer.print_text(
+            text, f"closing_{self.day.get().strip()}_{self.pos.db.now().strftime('%H%M%S')}")
+        messagebox.showinfo("인쇄", result["message"], parent=self)
 
     def _show(self, text):
         self.text.configure(state="normal")
@@ -728,7 +916,17 @@ class SettingsView(ttk.Frame):
         sec.pack(side="left", fill="y", padx=8)
         ttk.Button(sec, text="관리자 비밀번호 변경", command=self.change_pw).pack(fill="x", pady=2)
         ttk.Button(sec, text="DB 백업", command=self.backup).pack(fill="x", pady=2)
+        ttk.Button(sec, text="백업 파일로 복원", command=self.restore).pack(fill="x", pady=2)
         ttk.Button(sec, text="샘플 판매 데이터 생성 (30일)", command=self.demo).pack(fill="x", pady=2)
+        prn = ttk.LabelFrame(top, text=" 프린터 ", padding=8)
+        prn.pack(side="left", fill="y")
+        self.printer_var = tk.BooleanVar(value=self.pos.printer.enabled)
+        ttk.Checkbutton(prn, text="기본 프린터로 인쇄 사용", variable=self.printer_var,
+                        command=lambda: self.pos.printer.set_enabled(self.printer_var.get())).pack(
+            anchor="w")
+        ttk.Button(prn, text="테스트 인쇄", command=self.test_print).pack(fill="x", pady=4)
+        ttk.Label(prn, text="끄면 영수증·주문서를 prints 폴더에\n텍스트 파일로만 저장합니다.",
+                  foreground=COLORS["muted"], justify="left").pack(anchor="w")
         ttk.Label(self, text="작업 로그 (최근 300건)", font=font(10, True)).pack(anchor="w", pady=(10, 0))
         self.tree = make_tree(self, [("at", "일시", 140), ("mode", "모드", 70), ("action", "작업", 140),
                                      ("detail", "내용", 400)], height=14)
@@ -754,6 +952,36 @@ class SettingsView(ttk.Frame):
         path = self.pos.reports.backup()
         messagebox.showinfo("백업 완료", f"백업 파일: {path}", parent=self)
         self.refresh()
+
+    def test_print(self):
+        text = "\n".join(["=" * 32, f"{config.STORE_NAME} 테스트 인쇄".center(26), "=" * 32,
+                          f"출력 시각 {self.pos.db.now_str()}", "한글/숫자 정렬 확인 1234567890",
+                          "=" * 32])
+        result = self.pos.printer.print_text(text, "test_print")
+        messagebox.showinfo("테스트 인쇄", result["message"], parent=self)
+        self.refresh()
+
+    def restore(self):
+        from tkinter import filedialog
+        backups = self.pos.reports.backups()
+        initial = os.path.dirname(backups[0]) if backups else self.pos.reports.out_dir
+        path = filedialog.askopenfilename(
+            parent=self, title="복원할 백업 파일 선택", initialdir=initial,
+            filetypes=[("POS 백업", "*.db"), ("모든 파일", "*.*")])
+        if not path:
+            return
+        open_n = self.pos.db.scalar("SELECT COUNT(*) FROM orders WHERE status='OPEN'")
+        warn = f"\n\n※ 현재 진행 중인 주문 {open_n}건도 백업 시점으로 되돌아갑니다." if open_n else ""
+        if not messagebox.askyesno(
+                "DB 복원", f"{os.path.basename(path)} 시점으로 모든 데이터를 되돌립니다.\n"
+                           f"현재 데이터는 복원 전에 자동으로 백업됩니다.{warn}\n\n계속할까요?",
+                parent=self):
+            return
+        safety = run_safe(self, self.pos.reports.restore, path)
+        if safety:
+            messagebox.showinfo("복원 완료", f"복원했습니다.\n복원 전 데이터 백업: {safety}\n\n"
+                                         "관리자 비밀번호도 백업 시점의 값으로 돌아갑니다.", parent=self)
+            self.app.after_restore()
 
     def demo(self):
         if not messagebox.askyesno("샘플 데이터", "최근 30일치 가상 판매/근태 데이터를 추가합니다.\n"

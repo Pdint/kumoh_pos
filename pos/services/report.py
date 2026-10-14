@@ -69,9 +69,13 @@ class ReportService(Service):
             for it in items:
                 amt = it["unit_price"] * it["qty"]
                 out.append(_line(it["name"], f"{it['unit_price']:>6,} {it['qty']:>4} {amt:>11,}"))
+                if it["options"]:
+                    out.append(f"  + {it['options']}")
                 dc = self.discount.item_discount(it["unit_price"], it["discount_rate"]) * it["qty"]
                 if dc:
                     out.append(_line(f"  └ 메뉴할인 {it['discount_rate']}%", f"-{dc:,}"))
+                if it["refunded_qty"] and order["status"] == "PAID":
+                    out.append(f"  └ 환불 {it['refunded_qty']}개")
             out.append(dash)
             out.append(_line("합계(할인 전)", _won(calc["subtotal"])))
             if calc["menu_discount"]:
@@ -97,6 +101,17 @@ class ReportService(Service):
                 if p["method"] == "CASH":
                     out.append(_line("  받은 금액", _won(p["received"])))
                     out.append(_line("  거스름돈", _won(p["change"])))
+                elif p["method"] == "TRANSFER":
+                    out.append(f"  입금 계좌 {config.STORE_BANK_ACCOUNT}")
+        refunds = self.db.query("SELECT * FROM refunds WHERE order_id=? AND partial=1 ORDER BY id",
+                                (order_id,))
+        if refunds and order["status"] == "PAID":
+            out.append(dash)
+            for r in refunds:
+                out.append(_line(f"부분 환불({config.PAYMENT_METHODS[r['method']]})",
+                                 "-" + _won(r["amount"])))
+                out.append(f"  {r['detail']} / {r['reason']} ({r['at'][5:16]})")
+            out.append(_line("환불 후 결제 금액", _won(calc["total"] - order["refunded_amount"])))
         if order["member_id"]:
             m = self.db.query_one("SELECT * FROM members WHERE id=?", (order["member_id"],))
             out.append(dash)
@@ -179,10 +194,22 @@ class ReportService(Service):
             writer.writerows(rows)
         return path
 
-    def backup(self) -> str:
+    def backups(self) -> list[str]:
+        folder = os.path.join(self.out_dir, "backups")
+        if not os.path.isdir(folder):
+            return []
+        return sorted((os.path.join(folder, f) for f in os.listdir(folder) if f.endswith(".db")),
+                      reverse=True)
+
+    def backup(self, label: str = "") -> str:
         folder = os.path.join(self.out_dir, "backups")
         os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"pos_{self.db.now().strftime('%Y%m%d_%H%M%S')}.db")
+        stamp = self.db.now().strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(folder, f"pos_{stamp}{('_' + label) if label else ''}.db")
+        n = 1
+        while os.path.exists(path):  # 같은 초에 여러 번 백업하는 경우
+            n += 1
+            path = os.path.join(folder, f"pos_{stamp}{('_' + label) if label else ''}_{n}.db")
         dst = sqlite3.connect(path)
         with dst:
             self.db.conn.backup(dst)
@@ -190,3 +217,29 @@ class ReportService(Service):
         self.db.log("DB 백업", path)
         self.db.commit()
         return path
+
+    REQUIRED_TABLES = {"menus", "orders", "order_items", "payments", "ingredients", "settings"}
+
+    def restore(self, path: str) -> str:
+        """백업 파일로 현재 DB를 되돌린다. 복원 전에 현재 상태를 자동 백업하고 그 경로를 반환한다."""
+        if not os.path.isfile(path):
+            raise PosError("백업 파일을 찾을 수 없습니다.")
+        try:
+            src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            ok = src.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+        except sqlite3.DatabaseError:
+            raise PosError("올바른 POS 백업 파일이 아닙니다.") from None
+        if not ok or not self.REQUIRED_TABLES <= tables:
+            src.close()
+            raise PosError("올바른 POS 백업 파일이 아니거나 손상된 파일입니다.")
+        safety = self.backup("before_restore")
+        try:
+            self.db.commit()
+            src.backup(self.db.conn)
+        finally:
+            src.close()
+        self.db.migrate()  # 이전 버전 백업이면 새 컬럼 추가
+        self.db.log("DB 복원", f"{path} (복원 전 백업: {safety})")
+        self.db.commit()
+        return safety

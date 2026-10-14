@@ -15,9 +15,13 @@ DEFAULT_ADMIN_PASSWORD = "0000"
 MAX_ITEM_QTY = 99            # 한 주문 항목의 최대 수량
 MAX_TABLES = 30              # 등록 가능한 최대 테이블 수
 MAX_ORDER_ITEMS = 50         # 한 주문의 최대 항목(라인) 수
+MAX_MEMO_LENGTH = 40         # 주문 항목 요청사항(메모) 최대 글자 수
+MAX_OPTION_PRICE = 10_000    # 메뉴 옵션 추가금 상한(원)
 
 # ---- 결제 ----
-PAYMENT_METHODS = {"CASH": "현금", "CARD": "카드", "EASY": "간편결제"}
+PAYMENT_METHODS = {"CASH": "현금", "CARD": "카드", "EASY": "간편결제", "TRANSFER": "계좌이체"}
+# 계좌이체 결제 시 손님에게 안내할 입금 계좌
+STORE_BANK_ACCOUNT = "농협 351-0000-0000-00 (예금주: 금오분식)"
 ORDER_TYPES = {"DINE_IN": "매장", "TAKEOUT": "포장"}
 MAX_SPLIT_COUNT = 10         # 분할 결제 최대 횟수
 

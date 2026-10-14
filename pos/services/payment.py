@@ -182,8 +182,115 @@ class PaymentService(Service):
         return earned
 
     # ------------------------------------------------------------ 취소 / 환불
+    def refunds(self, order_id: int):
+        return self.db.query("SELECT * FROM refunds WHERE order_id=? ORDER BY id", (order_id,))
+
+    def refundable_by_method(self, order_id: int) -> dict[str, int]:
+        """결제수단별로 아직 환불할 수 있는 금액."""
+        out: dict[str, int] = {}
+        for r in self.db.query(
+                "SELECT method, SUM(amount) AS amt FROM payments "
+                "WHERE order_id=? AND refunded_at IS NULL GROUP BY method", (order_id,)):
+            out[r["method"]] = r["amt"]
+        for r in self.db.query(
+                "SELECT method, SUM(amount) AS amt FROM refunds "
+                "WHERE order_id=? AND partial=1 GROUP BY method", (order_id,)):
+            out[r["method"]] = out.get(r["method"], 0) - r["amt"]
+        return {m: a for m, a in out.items() if a > 0}
+
+    def _revoke_points(self, order, refunded_total: int, full: bool) -> None:
+        """환불 비율만큼 적립 포인트 회수(보유 포인트를 넘지 않음)."""
+        if not order["member_id"] or not order["points_earned"]:
+            return
+        paid = order["total"]
+        target = order["points_earned"] if full or not paid else \
+            int(order["points_earned"] * refunded_total / paid)
+        take = min(target - order["points_revoked"],
+                   self.member.get(order["member_id"])["points"])
+        if take > 0:
+            self.member.adjust_points(order["member_id"], -take, "환불 적립 취소", order["id"])
+            self.db.execute("UPDATE orders SET points_revoked=points_revoked+? WHERE id=?",
+                            (take, order["id"]))
+
+    def item_refund_amount(self, order_id: int, item_qtys: dict[int, int]) -> int:
+        """메뉴 부분 환불 금액: 메뉴할인 후 금액 × (실결제액 ÷ 메뉴할인 후 총액), 10원 단위 반올림."""
+        order = self._order(order_id)
+        if order["status"] != "PAID":
+            raise PosError("결제 완료된 주문만 부분 환불할 수 있습니다.")
+        items = {i["id"]: i for i in self.db.query(
+            "SELECT * FROM order_items WHERE order_id=?", (order_id,))}
+        selected = 0
+        all_after = True
+        for iid, it in items.items():
+            q = item_qtys.get(iid, 0)
+            if q < 0 or q > it["qty"] - it["refunded_qty"]:
+                raise PosError(f"'{it['name']}'의 환불 수량이 올바르지 않습니다.")
+            selected += (it["unit_price"] - self.discount.item_discount(
+                it["unit_price"], it["discount_rate"])) * q
+            if it["refunded_qty"] + q < it["qty"]:
+                all_after = False
+        if not any(item_qtys.values()):
+            raise PosError("환불할 메뉴를 선택하세요.")
+        remaining = sum(self.refundable_by_method(order_id).values())
+        if all_after:
+            return remaining
+        net_total = order["subtotal"] - order["menu_discount"]
+        ratio = order["total"] / net_total if net_total else 0
+        return min(remaining, round(selected * ratio / 10) * 10)
+
+    def refund_items(self, order_id: int, item_qtys: dict[int, int], reason: str,
+                     method: str | None = None, restock: bool = False) -> int:
+        """결제 완료 주문에서 일부 메뉴만 환불한다. 모든 메뉴를 환불하면 전체 환불로 처리.
+
+        환불 수단은 method(기본: 남은 금액이 가장 큰 결제수단)부터 차감하고, 부족하면
+        다른 결제수단에서 나머지를 환불한다.
+        """
+        if not reason.strip():
+            raise PosError("환불 사유를 입력하세요.")
+        item_qtys = {k: v for k, v in item_qtys.items() if v}
+        amount = self.item_refund_amount(order_id, item_qtys)
+        items = {i["id"]: i for i in self.db.query(
+            "SELECT * FROM order_items WHERE order_id=?", (order_id,))}
+        if all(items[i]["refunded_qty"] + item_qtys.get(i, 0) >= items[i]["qty"] for i in items):
+            return self.refund(order_id, reason, restock)
+        order = self._order(order_id)
+        avail = self.refundable_by_method(order_id)
+        if method is not None and method not in avail:
+            raise PosError(f"{config.PAYMENT_METHODS.get(method, method)}(으)로 환불할 금액이 없습니다.")
+        order_methods = sorted(avail, key=lambda m: (m != method, -avail[m]))
+        detail = ", ".join(f"{items[i]['name']}×{q}" for i, q in item_qtys.items())
+        now = self.db.now_str()
+        try:
+            left = amount
+            for m in order_methods:
+                take = min(left, avail[m])
+                if take:
+                    self.db.execute(
+                        "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at) "
+                        "VALUES(?,?,?,?,?,1,?)", (order_id, m, take, reason.strip(), detail, now))
+                    left -= take
+            for iid, q in item_qtys.items():
+                self.db.execute("UPDATE order_items SET refunded_qty=refunded_qty+? WHERE id=?",
+                                (q, iid))
+                if restock:
+                    it = items[iid]
+                    self.menu.consume(it["menu_id"], -q, f"주문 #{order_id} 부분 환불 재입고",
+                                      [int(x) for x in it["option_ids"].split(",") if x])
+            self.db.execute("UPDATE orders SET refunded_amount=refunded_amount+? WHERE id=?",
+                            (amount, order_id))
+            if order["member_id"]:
+                self.db.execute("UPDATE members SET total_spent=MAX(0, total_spent-?) WHERE id=?",
+                                (amount, order["member_id"]))
+            self._revoke_points(self._order(order_id), order["refunded_amount"] + amount, False)
+            self.db.log("부분 환불", f"#{order_id} {amount:,}원 {detail} ({reason})")
+        except Exception:
+            self.db.rollback()
+            raise
+        self.db.commit()
+        return amount
+
     def refund(self, order_id: int, reason: str, restock: bool = False) -> int:
-        """결제 완료 주문의 환불(→REFUNDED) 또는 부분 결제 중 주문의 결제 취소(→CANCELLED).
+        """결제 완료 주문의 (남은 금액) 전체 환불(→REFUNDED) 또는 부분 결제 중 주문의 결제 취소(→CANCELLED).
 
         환불액을 반환한다. 환불 내역은 환불 시각 기준으로 매출 통계에 반영된다.
         """
@@ -198,19 +305,17 @@ class PaymentService(Service):
             raise PosError("환불 사유를 입력하세요.")
         now = self.db.now_str()
         try:
-            refunded = self.db.scalar(
-                "SELECT COALESCE(SUM(amount),0) FROM payments "
-                "WHERE order_id=? AND refunded_at IS NULL", (order_id,))
+            avail = self.refundable_by_method(order_id)
+            refunded = sum(avail.values())
+            for m, amt in avail.items():
+                self.db.execute(
+                    "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at) "
+                    "VALUES(?,?,?,?,?,0,?)", (order_id, m, amt, reason.strip(), "전체", now))
             self.db.execute(
                 "UPDATE payments SET refunded_at=? WHERE order_id=? AND refunded_at IS NULL",
                 (now, order_id))
             if order["member_id"]:
-                member = self.member.get(order["member_id"])
-                if order["points_earned"]:
-                    take = min(order["points_earned"], member["points"])
-                    if take:
-                        self.member.adjust_points(order["member_id"], -take, "환불 적립 취소",
-                                                  order_id)
+                self._revoke_points(order, order["total"], True)
                 if order["points_used"]:
                     self.member.adjust_points(order["member_id"], order["points_used"],
                                               "환불 포인트 복원", order_id)
@@ -224,10 +329,14 @@ class PaymentService(Service):
                     (order["coupon_code"],))
             if restock:
                 for item in self.db.query("SELECT * FROM order_items WHERE order_id=?", (order_id,)):
-                    self.menu.consume(item["menu_id"], -item["qty"], f"주문 #{order_id} 환불 재입고")
+                    left = item["qty"] - item["refunded_qty"]
+                    if left:
+                        self.menu.consume(item["menu_id"], -left, f"주문 #{order_id} 환불 재입고",
+                                          [int(x) for x in item["option_ids"].split(",") if x])
             self.db.execute(
-                "UPDATE orders SET status=?, cancelled_at=?, cancel_reason=? WHERE id=?",
-                (new_status, now, reason.strip(), order_id))
+                "UPDATE orders SET status=?, cancelled_at=?, cancel_reason=?, "
+                "refunded_amount=refunded_amount+? WHERE id=?",
+                (new_status, now, reason.strip(), refunded, order_id))
             self.db.log("환불" if new_status == "REFUNDED" else "결제 취소",
                         f"#{order_id} {refunded:,}원 ({reason})")
         except Exception:

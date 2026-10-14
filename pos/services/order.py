@@ -92,8 +92,12 @@ class OrderService(Service):
             raise PosError("결제가 진행 중인 주문은 메뉴를 변경할 수 없습니다.")
 
     # ------------------------------------------------------------ 항목 추가/변경/삭제
-    def add_item(self, order_id: int, menu_id: int, qty: int = 1, commit: bool = True) -> list[str]:
-        """메뉴를 주문에 추가하고 재고 경고 메시지 목록을 반환한다."""
+    def add_item(self, order_id: int, menu_id: int, qty: int = 1, commit: bool = True,
+                 option_ids=(), memo: str = "") -> list[str]:
+        """메뉴(옵션·요청사항 포함)를 주문에 추가하고 재고 경고 메시지 목록을 반환한다.
+
+        같은 메뉴라도 옵션이나 요청사항이 다르면 별도 항목으로 담는다.
+        """
         order = self.get(order_id)
         self._check_editable(order)
         if not 1 <= qty <= config.MAX_ITEM_QTY:
@@ -103,11 +107,16 @@ class OrderService(Service):
             raise PosError("판매 중지된 메뉴입니다.")
         if menu["manual_soldout"]:
             raise PosError(f"'{menu['name']}'은(는) 품절입니다.")
+        memo = self._check_memo(memo)
+        opts, opt_price, opt_label = self.menu.resolve_options(menu_id, option_ids)
+        opt_key = ",".join(str(o["id"]) for o in opts)
+        opt_cost = 0  # 옵션 원가는 재료 차감으로 관리, 판매 원가는 메뉴 원가 기준
+        unit_price = menu["price"] + opt_price
 
         same = self.db.query_one(
             "SELECT * FROM order_items WHERE order_id=? AND menu_id=? AND status='WAITING' "
-            "AND unit_price=? AND discount_rate=?",
-            (order_id, menu_id, menu["price"], menu["discount_rate"]),
+            "AND unit_price=? AND discount_rate=? AND option_ids=? AND memo=? AND paid_qty=0",
+            (order_id, menu_id, unit_price, menu["discount_rate"], opt_key, memo),
         )
         if same and same["qty"] + qty > config.MAX_ITEM_QTY:
             raise PosError(f"한 메뉴의 수량은 최대 {config.MAX_ITEM_QTY}개입니다.")
@@ -116,20 +125,50 @@ class OrderService(Service):
         ) >= config.MAX_ORDER_ITEMS:
             raise PosError(f"한 주문에는 최대 {config.MAX_ORDER_ITEMS}개 항목까지 담을 수 있습니다.")
 
-        warnings = self.menu.consume(menu_id, qty, f"주문 #{order_id}")
+        warnings = self.menu.consume(menu_id, qty, f"주문 #{order_id}", [o["id"] for o in opts])
         if same:
             self.db.execute("UPDATE order_items SET qty=qty+? WHERE id=?", (qty, same["id"]))
         else:
             self.db.execute(
                 "INSERT INTO order_items(order_id, menu_id, name, unit_price, unit_cost, "
-                "discount_rate, qty, ordered_at) VALUES(?,?,?,?,?,?,?,?)",
-                (order_id, menu_id, menu["name"], menu["price"], menu["cost"],
-                 menu["discount_rate"], qty, self.db.now_str()),
+                "discount_rate, qty, ordered_at, option_ids, options, memo) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (order_id, menu_id, menu["name"], unit_price, menu["cost"] + opt_cost,
+                 menu["discount_rate"], qty, self.db.now_str(), opt_key, opt_label, memo),
             )
         self.db.execute("UPDATE orders SET completed_at=NULL WHERE id=?", (order_id,))
         if commit:
             self.db.commit()
         return warnings
+
+    @staticmethod
+    def _check_memo(memo: str) -> str:
+        memo = " ".join((memo or "").split())
+        if len(memo) > config.MAX_MEMO_LENGTH:
+            raise PosError(f"요청사항은 {config.MAX_MEMO_LENGTH}자 이내로 입력하세요.")
+        return memo
+
+    def set_item_memo(self, item_id: int, memo: str) -> None:
+        """요청사항 수정. 조리 시작 전 항목만 바꿀 수 있다."""
+        item = self._item(item_id)
+        self._check_editable(self.get(item["order_id"]))
+        if item["status"] != "WAITING":
+            raise PosError("조리가 시작된 메뉴는 요청사항을 바꿀 수 없습니다.")
+        self.db.execute("UPDATE order_items SET memo=? WHERE id=?",
+                        (self._check_memo(memo), item_id))
+        self.db.commit()
+
+    @staticmethod
+    def item_label(item) -> str:
+        """화면·영수증용 메뉴 표시: 이름 [옵션] (요청사항)"""
+        text = item["name"]
+        if item["options"]:
+            text += f" [{item['options']}]"
+        return text
+
+    @staticmethod
+    def option_ids_of(item) -> list[int]:
+        return [int(x) for x in item["option_ids"].split(",") if x]
 
     def _item(self, item_id: int):
         row = self.db.query_one("SELECT * FROM order_items WHERE id=?", (item_id,))
@@ -146,9 +185,11 @@ class OrderService(Service):
         diff = qty - item["qty"]
         warnings: list[str] = []
         if diff > 0:
-            warnings = self.menu.consume(item["menu_id"], diff, f"주문 #{item['order_id']} 수량 변경")
+            warnings = self.menu.consume(item["menu_id"], diff, f"주문 #{item['order_id']} 수량 변경",
+                                         self.option_ids_of(item))
         elif diff < 0 and item["status"] == "WAITING":
-            self.menu.consume(item["menu_id"], diff, f"주문 #{item['order_id']} 수량 변경")
+            self.menu.consume(item["menu_id"], diff, f"주문 #{item['order_id']} 수량 변경",
+                              self.option_ids_of(item))
         if qty == 0:
             self.db.execute("DELETE FROM order_items WHERE id=?", (item_id,))
         else:
@@ -166,7 +207,8 @@ class OrderService(Service):
         self._check_editable(order)
         for item in self.items(order_id):
             if item["status"] == "WAITING":
-                self.menu.consume(item["menu_id"], -item["qty"], f"주문 #{order_id} 취소")
+                self.menu.consume(item["menu_id"], -item["qty"], f"주문 #{order_id} 취소",
+                                  self.option_ids_of(item))
         if not self.items(order_id):
             # 아무것도 담지 않은 주문은 기록하지 않는다.
             self.db.execute("DELETE FROM orders WHERE id=?", (order_id,))
@@ -246,13 +288,16 @@ class OrderService(Service):
             if qty == item["qty"]:
                 self.db.execute("UPDATE order_items SET order_id=? WHERE id=?", (dst_id, item_id))
             else:
-                self.db.execute("UPDATE order_items SET qty=qty-? WHERE id=?", (qty, item_id))
+                self.db.execute("UPDATE order_items SET qty=qty-?, ticket_qty=MAX(0, ticket_qty-?) "
+                                "WHERE id=?", (qty, qty, item_id))
                 self.db.execute(
                     "INSERT INTO order_items(order_id, menu_id, name, unit_price, unit_cost, "
-                    "discount_rate, qty, status, ordered_at, done_at) "
+                    "discount_rate, qty, status, ordered_at, done_at, option_ids, options, memo, "
+                    "ticket_qty) "
                     "SELECT ?, menu_id, name, unit_price, unit_cost, discount_rate, ?, status, "
-                    "ordered_at, done_at FROM order_items WHERE id=?",
-                    (dst_id, qty, item_id),
+                    "ordered_at, done_at, option_ids, options, memo, MIN(ticket_qty, ?) "
+                    "FROM order_items WHERE id=?",
+                    (dst_id, qty, qty, item_id),
                 )
         if not self.items(src_order_id):
             self.db.execute("DELETE FROM orders WHERE id=?", (src_order_id,))
@@ -302,6 +347,35 @@ class OrderService(Service):
             )
         else:
             self.db.execute("UPDATE orders SET completed_at=NULL WHERE id=?", (order_id,))
+
+    def pending_ticket_lines(self, order_id: int) -> list[tuple]:
+        """주방에 아직 전달하지 않은 변경분: (항목, 추가 수량(+) 또는 취소 수량(-))."""
+        return [(it, it["qty"] - it["ticket_qty"]) for it in self.items(order_id)
+                if it["qty"] != it["ticket_qty"]]
+
+    def kitchen_ticket(self, order_id: int, mark_sent: bool = True) -> str:
+        """주방 주문서 텍스트(마지막 출력 이후 추가·취소된 수량만). 출력할 내용이 없으면 오류."""
+        order = self.get(order_id)
+        lines = self.pending_ticket_lines(order_id)
+        # 항목을 삭제한 경우(주문서는 나갔는데 항목이 사라짐)는 추적하지 않는다.
+        if not lines:
+            raise PosError("주방에 새로 보낼 메뉴가 없습니다.")
+        first = not any(it["ticket_qty"] for it in self.items(order_id))
+        out = ["=" * 32, ("[주방 주문서]" if first else "[추가 주문서]").center(28),
+               "=" * 32, self.label(order), f"출력 {self.db.now_str()[5:16]}", "-" * 32]
+        for it, diff in lines:
+            mark = f"+{diff}" if diff > 0 else f"취소 {-diff}"
+            width = sum(2 if ord(c) > 0x2E80 else 1 for c in it["name"])
+            out.append(it["name"] + " " * max(1, 24 - width) + f"{mark:>8}")
+            if it["options"]:
+                out.append(f"  - {it['options']}")
+            if it["memo"]:
+                out.append(f"  * 요청: {it['memo']}")
+        out.append("=" * 32)
+        if mark_sent:
+            self.db.execute("UPDATE order_items SET ticket_qty=qty WHERE order_id=?", (order_id,))
+            self.db.commit()
+        return "\n".join(out)
 
     def mark_picked_up(self, order_id: int) -> None:
         order = self.get(order_id)
