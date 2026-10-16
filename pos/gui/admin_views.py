@@ -988,6 +988,8 @@ class SettingsView(ttk.Frame):
                                              "(통계 기능 시연용) 계속할까요?", parent=self):
             return
         from ..demo import generate
-        n = generate(self.pos, 30, seed=int(date.today().strftime("%j")))
+        n = run_safe(self, generate, self.pos, 30, seed=int(date.today().strftime("%j")))
+        if n is None:
+            return
         messagebox.showinfo("완료", f"샘플 주문 {n}건을 생성했습니다.", parent=self)
         self.app.refresh_all()

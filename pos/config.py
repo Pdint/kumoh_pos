@@ -25,6 +25,12 @@ STORE_BANK_ACCOUNT = "농협 351-0000-0000-00 (예금주: 금오분식)"
 ORDER_TYPES = {"DINE_IN": "매장", "TAKEOUT": "포장"}
 MAX_SPLIT_COUNT = 10         # 분할 결제 최대 횟수
 
+# ---- 시재(금전함 현금) ----
+CASH_DENOMINATIONS = [50_000, 10_000, 5_000, 1_000, 500, 100, 50, 10]  # 권종
+DEFAULT_OPENING_CASH = 100_000   # 첫 개시 기본 준비금
+MAX_OPENING_CASH = 1_000_000     # 개시 금액 상한
+CASH_DIFF_ADMIN_LIMIT = 10_000   # 과부족이 이 금액 이상이면 관리자 모드에서만 정산
+
 # ---- 할인 ----
 DISCOUNT_UNIT = 10           # 할인 금액은 10원 단위 절사
 MAX_MENU_DISCOUNT_RATE = 50  # 메뉴별 할인율 상한(%)

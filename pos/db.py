@@ -163,6 +163,39 @@ CREATE TABLE IF NOT EXISTS refunds (
     partial   INTEGER NOT NULL DEFAULT 0,
     at        TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS cash_sessions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    status         TEXT NOT NULL DEFAULT 'OPEN',
+    opened_at      TEXT NOT NULL,
+    opened_by      TEXT,
+    opening_cash   INTEGER NOT NULL,
+    closed_at      TEXT,
+    closed_by      TEXT,
+    expected_cash  INTEGER,
+    counted_cash   INTEGER,
+    difference     INTEGER,
+    note           TEXT
+);
+CREATE TABLE IF NOT EXISTS cash_movements (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  INTEGER NOT NULL REFERENCES cash_sessions(id),
+    kind        TEXT NOT NULL CHECK (kind IN ('IN','OUT')),
+    amount      INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    at          TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cash_checks (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     INTEGER NOT NULL REFERENCES cash_sessions(id),
+    kind           TEXT NOT NULL CHECK (kind IN ('CHECK','CLOSE')),
+    at             TEXT NOT NULL,
+    expected_cash  INTEGER NOT NULL,
+    counted_cash   INTEGER NOT NULL,
+    difference     INTEGER NOT NULL,
+    denominations  TEXT NOT NULL,
+    note           TEXT,
+    checked_by     TEXT
+);
 CREATE TABLE IF NOT EXISTS staff (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     name            TEXT NOT NULL,
@@ -223,6 +256,8 @@ MIGRATIONS = [
     ("order_items", "ticket_qty", "INTEGER NOT NULL DEFAULT 0"),
     ("orders", "refunded_amount", "INTEGER NOT NULL DEFAULT 0"),
     ("orders", "points_revoked", "INTEGER NOT NULL DEFAULT 0"),
+    ("payments", "cash_session_id", "INTEGER"),
+    ("refunds", "cash_session_id", "INTEGER"),
 ]
 
 

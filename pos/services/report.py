@@ -26,8 +26,10 @@ def _won(n: int) -> str:
 
 
 class ReportService(Service):
-    def __init__(self, db, discount: DiscountService, stats: StatsService, out_dir: str = "."):
+    def __init__(self, db, discount: DiscountService, stats: StatsService, out_dir: str = ".",
+                 cash=None):
         super().__init__(db)
+        self.cash = cash
         self.discount = discount
         self.stats = stats
         self.out_dir = out_dir
@@ -157,6 +159,23 @@ class ReportService(Service):
             out.append(_line(f"  {m['rank']}. {m['name']}", f"{m['qty']}개 {_won(m['revenue'])}"))
         if not r["top_menus"]:
             out.append("  (판매 내역 없음)")
+        if self.cash is not None:
+            out += [dash, "[시재 정산]"]
+            sessions = self.cash.day_summary(business_date)
+            for c in sessions:
+                out.append(f"  {c['opened_at'][11:16]}~{c['closed_at'][11:16]} {c['opened_by'] or ''}".rstrip())
+                out.append(_line("    개시 금액", _won(c["opening"])))
+                out.append(_line("    현금 매출", f"+{_won(c['cash_sales'])}"))
+                if c["cash_refunds"]:
+                    out.append(_line("    현금 환불", f"-{_won(c['cash_refunds'])}"))
+                if c["cash_in"] or c["cash_out"]:
+                    out.append(_line("    입금 / 출금", f"+{c['cash_in']:,} / -{c['cash_out']:,}"))
+                out.append(_line("    예상 / 실제", f"{c['expected']:,} / {c['counted']:,}"))
+                out.append(_line("    과부족", f"{c['difference']:+,}원"))
+            if sessions:
+                out.append(_line("  과부족 합계", f"{sum(c['difference'] for c in sessions):+,}원"))
+            else:
+                out.append("  (정산된 시재 없음)")
         out.append(bar)
         return "\n".join(out)
 
@@ -173,6 +192,8 @@ class ReportService(Service):
             (business_date,))
         if open_n:
             raise PosError(f"미결제 주문이 {open_n}건 남아있어 마감할 수 없습니다.")
+        if self.cash is not None and self.cash.current():
+            raise PosError("시재가 정산되지 않았습니다. '시재' 탭에서 시재 정산을 먼저 하세요.")
         text = self.closing_text(business_date)
         self.db.execute("INSERT INTO closings(business_date, closed_at, report) VALUES(?,?,?)",
                         (business_date, self.db.now_str(), text))

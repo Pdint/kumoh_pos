@@ -7,6 +7,8 @@ from __future__ import annotations
 import random
 from datetime import datetime, timedelta
 
+from . import config
+from .services import PosError
 from .system import PosSystem
 
 # 시간대별 주문 가중치 (점심/저녁 피크)
@@ -14,6 +16,8 @@ HOUR_WEIGHTS = {11: 4, 12: 10, 13: 7, 14: 3, 15: 2, 16: 2, 17: 5, 18: 9, 19: 7, 
 
 
 def generate(pos: PosSystem, days: int = 60, seed: int = 42) -> int:
+    if pos.cash.current():
+        raise PosError("시재가 개시된 상태에서는 샘플 데이터를 만들 수 없습니다. 시재를 먼저 정산하세요.")
     rng = random.Random(seed)
     real_now = pos.db._now
     clock = {"t": datetime.now()}
@@ -33,6 +37,10 @@ def generate(pos: PosSystem, days: int = 60, seed: int = 42) -> int:
     count = 0
     for d in range(days, 0, -1):
         day = today - timedelta(days=d)
+        # 시재 개시 (전날 남긴 현금 이월)
+        clock["t"] = day.replace(hour=10, minute=30)
+        if not pos.cash.current():
+            pos.cash.open(min(pos.cash.default_opening(), 100_000), "김사장")
         # 매일 아침 재고 보충
         for ing in pos.menu.ingredients():
             if ing["stock"] < ing["threshold"] * 5:
@@ -101,7 +109,32 @@ def generate(pos: PosSystem, days: int = 60, seed: int = 42) -> int:
                     clock["t"] += timedelta(minutes=5)
                     pos.payments.refund_items(oid, {items[0]["id"]: 1}, "메뉴 잘못 나옴")
             count += 1
+        _settle_cash(pos, clock, day, rng)
     pos.db._now = real_now
     pos.db.log("샘플 데이터 생성", f"{days}일 {count}건")
     pos.db.commit()
     return count
+
+
+def _denominations(amount: int) -> dict[int, int]:
+    out = {}
+    for unit in config.CASH_DENOMINATIONS:
+        out[unit], amount = divmod(amount, unit)
+    return out
+
+
+def _settle_cash(pos: PosSystem, clock: dict, day: datetime, rng: random.Random) -> None:
+    """영업 종료: 10만원만 남기고 은행 입금 후 시재 정산(가끔 작은 과부족 발생)."""
+    if not pos.cash.current():
+        return
+    clock["t"] = day.replace(hour=21, minute=30)
+    if rng.random() < 0.3:
+        pos.cash.add_movement("OUT", rng.choice([5_000, 12_000, 20_000]), "재료 구입(시장)")
+    expected = pos.cash.summary()["expected"]
+    if expected > 100_000:
+        pos.cash.add_movement("OUT", (expected - 100_000) // 10 * 10, "은행 입금")
+    expected = pos.cash.summary()["expected"]
+    diff = rng.choice([0, 0, 0, 0, -500, -1_000, 500])
+    counted = max(0, expected + diff)
+    clock["t"] += timedelta(minutes=5)
+    pos.cash.close(_denominations(counted), "잔돈 계산 실수" if counted != expected else "", "김사장")

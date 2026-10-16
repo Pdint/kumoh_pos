@@ -11,6 +11,7 @@ from ..services.staff import KINDS
 from ..system import PosSystem
 from .admin_views import (ClosingView, DiscountView, InventoryView, MenuAdminView,
                           OrderHistoryView, SettingsView, StaffView, TableAdminView)
+from .cash_view import CashView
 from .kitchen import KitchenView
 from .member_view import MemberView
 from .order_view import OrderView
@@ -18,8 +19,8 @@ from .reservation_view import ReservationView
 from .stats_view import StatsView
 from .widgets import COLORS, center, font, init_fonts, make_tree, run_safe
 
-USER_TABS = [("주문 / 결제", OrderView), ("주방", KitchenView), ("예약", ReservationView),
-             ("회원", MemberView)]
+USER_TABS = [("주문 / 결제", OrderView), ("주방", KitchenView), ("시재", CashView),
+             ("예약", ReservationView), ("회원", MemberView)]
 ADMIN_TABS = [("주문 내역·환불", OrderHistoryView), ("매출 통계", StatsView), ("메뉴", MenuAdminView),
               ("재고", InventoryView), ("테이블", TableAdminView), ("할인·쿠폰", DiscountView),
               ("직원·급여", StaffView), ("일일 마감", ClosingView), ("설정", SettingsView)]
@@ -57,6 +58,7 @@ class App(tk.Tk):
         self.nb.bind("<<NotebookTabChanged>>", lambda e: self.refresh_current())
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<F12>", lambda e: self.toggle_mode())
+        self._update_cash_label()
         self._tick()
         self.after(1500, self._check_reservations)
         self.after(800, self._startup_stock_check)
@@ -85,6 +87,10 @@ class App(tk.Tk):
         self.mode_btn.pack(side="right", padx=4, pady=10)
         tk.Button(head, text="출퇴근", font=font(10, True), relief="flat", padx=12,
                   command=self.attendance).pack(side="right", padx=4, pady=10)
+        self.cash_lbl = tk.Label(head, text="", bg=COLORS["header"], font=font(10, True),
+                                 cursor="hand2")
+        self.cash_lbl.pack(side="right", padx=6)
+        self.cash_lbl.bind("<Button-1>", lambda e: self.show_tab("시재"))
         self.alert_lbl = tk.Label(head, text="", bg=COLORS["header"], fg="#fbbf24", font=font(10, True),
                                   cursor="hand2")
         self.alert_lbl.pack(side="right", padx=10)
@@ -134,6 +140,13 @@ class App(tk.Tk):
         self.refresh_current()
         self._update_low_stock_memory()
         self._update_alert()
+        self._update_cash_label()
+
+    def _update_cash_label(self):
+        if self.pos.cash.current():
+            self.cash_lbl.configure(text="시재 개시 중", fg="#86efac")
+        else:
+            self.cash_lbl.configure(text="시재 미개시", fg="#fca5a5")
 
     def after_restore(self):
         """DB 복원 후 화면 상태를 초기화한다."""

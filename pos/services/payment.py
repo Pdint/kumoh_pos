@@ -4,13 +4,16 @@ from __future__ import annotations
 from .. import config
 from . import PosError, Service
 from .discount import DiscountService
+from .cash import CashService
 from .member import MemberService, grade_of
 from .menu import MenuService
 
 
 class PaymentService(Service):
-    def __init__(self, db, menu: MenuService, discount: DiscountService, member: MemberService):
+    def __init__(self, db, menu: MenuService, discount: DiscountService, member: MemberService,
+                 cash: CashService | None = None):
         super().__init__(db)
+        self.cash = cash or CashService(db)
         self.menu = menu
         self.discount = discount
         self.member = member
@@ -122,6 +125,7 @@ class PaymentService(Service):
             "SELECT COUNT(*) FROM payments WHERE order_id=? AND refunded_at IS NULL", (order_id,))
         if n_payments >= config.MAX_SPLIT_COUNT:
             raise PosError(f"분할 결제는 최대 {config.MAX_SPLIT_COUNT}회까지 가능합니다.")
+        cash_session = self.cash.require_open("현금 결제") if method == "CASH" else None
 
         try:
             if item_qtys:
@@ -147,9 +151,9 @@ class PaymentService(Service):
                         self.db.execute("UPDATE order_items SET paid_qty=paid_qty+? WHERE id=?",
                                         (qty, item_id))
             payment_id = self.db.execute(
-                "INSERT INTO payments(order_id, method, amount, received, change, paid_at, memo) "
-                "VALUES(?,?,?,?,?,?,?)",
-                (order_id, method, amount, received, change, self.db.now_str(), memo),
+                "INSERT INTO payments(order_id, method, amount, received, change, paid_at, memo, "
+                "cash_session_id) VALUES(?,?,?,?,?,?,?,?)",
+                (order_id, method, amount, received, change, self.db.now_str(), memo, cash_session),
             ).lastrowid
             remaining -= amount
             earned = self._finalize(order_id) if remaining == 0 else 0
@@ -197,6 +201,17 @@ class PaymentService(Service):
                 "WHERE order_id=? AND partial=1 GROUP BY method", (order_id,)):
             out[r["method"]] = out.get(r["method"], 0) - r["amt"]
         return {m: a for m, a in out.items() if a > 0}
+
+    def _cash_refund_session(self, cash_amount: int) -> int | None:
+        """현금 환불이 포함되면 개시된 시재가 필요하고, 금전함 예상 현금을 넘을 수 없다."""
+        if not cash_amount:
+            return None
+        session_id = self.cash.require_open("현금 환불")
+        expected = self.cash.summary(session_id)["expected"]
+        if cash_amount > expected:
+            raise PosError(f"금전함 예상 현금({expected:,}원)이 부족해 현금 {cash_amount:,}원을 "
+                           "환불할 수 없습니다. 다른 결제수단으로 환불하거나 시재 입금 후 진행하세요.")
+        return session_id
 
     def _revoke_points(self, order, refunded_total: int, full: bool) -> None:
         """환불 비율만큼 적립 포인트 회수(보유 포인트를 넘지 않음)."""
@@ -260,15 +275,20 @@ class PaymentService(Service):
         order_methods = sorted(avail, key=lambda m: (m != method, -avail[m]))
         detail = ", ".join(f"{items[i]['name']}×{q}" for i, q in item_qtys.items())
         now = self.db.now_str()
+        plan, left = [], amount
+        for m in order_methods:
+            take = min(left, avail[m])
+            if take:
+                plan.append((m, take))
+                left -= take
+        cash_session = self._cash_refund_session(sum(t for m, t in plan if m == "CASH"))
         try:
-            left = amount
-            for m in order_methods:
-                take = min(left, avail[m])
-                if take:
-                    self.db.execute(
-                        "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at) "
-                        "VALUES(?,?,?,?,?,1,?)", (order_id, m, take, reason.strip(), detail, now))
-                    left -= take
+            for m, take in plan:
+                self.db.execute(
+                    "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at, "
+                    "cash_session_id) VALUES(?,?,?,?,?,1,?,?)",
+                    (order_id, m, take, reason.strip(), detail, now,
+                     cash_session if m == "CASH" else None))
             for iid, q in item_qtys.items():
                 self.db.execute("UPDATE order_items SET refunded_qty=refunded_qty+? WHERE id=?",
                                 (q, iid))
@@ -304,13 +324,16 @@ class PaymentService(Service):
         if not reason.strip():
             raise PosError("환불 사유를 입력하세요.")
         now = self.db.now_str()
+        avail = self.refundable_by_method(order_id)
+        cash_session = self._cash_refund_session(avail.get("CASH", 0))
         try:
-            avail = self.refundable_by_method(order_id)
             refunded = sum(avail.values())
             for m, amt in avail.items():
                 self.db.execute(
-                    "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at) "
-                    "VALUES(?,?,?,?,?,0,?)", (order_id, m, amt, reason.strip(), "전체", now))
+                    "INSERT INTO refunds(order_id, method, amount, reason, detail, partial, at, "
+                    "cash_session_id) VALUES(?,?,?,?,?,0,?,?)",
+                    (order_id, m, amt, reason.strip(), "전체", now,
+                     cash_session if m == "CASH" else None))
             self.db.execute(
                 "UPDATE payments SET refunded_at=? WHERE order_id=? AND refunded_at IS NULL",
                 (now, order_id))

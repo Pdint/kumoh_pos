@@ -163,6 +163,7 @@ class PaymentDialog(tk.Toplevel):
             row=2, column=2, columnspan=2, sticky="e")
         self.change_lbl = tk.Label(self.cash_box, text="거스름돈 0원", font=font(14, True),
                                    fg=COLORS["ok"])
+        self.no_cash_lbl = tk.Label(self.cash_box, text="", fg=COLORS["danger"], font=font(9, True))
         self.change_lbl.grid(row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
 
         self.pay_btn = ttk.Button(parent, text="결제하기", style="Accent.TButton", command=self.pay)
@@ -272,6 +273,11 @@ class PaymentDialog(tk.Toplevel):
         method = self.method.get()
         if method == "CASH":
             self.cash_box.pack(fill="x", pady=6, after=self.method_box)
+            if self.pos.cash.current():
+                self.no_cash_lbl.grid_forget()
+            else:
+                self.no_cash_lbl.configure(text="시재가 개시되지 않아 현금 결제를 할 수 없습니다. ('시재' 탭)")
+                self.no_cash_lbl.grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
         else:
             self.cash_box.pack_forget()
         if method == "TRANSFER":

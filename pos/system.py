@@ -6,6 +6,7 @@ from typing import Callable
 
 from .db import Database, seed_default_options, seed_initial_data
 from .services.auth import AuthService
+from .services.cash import CashService
 from .services.discount import DiscountService
 from .services.member import MemberService
 from .services.menu import MenuService
@@ -31,11 +32,12 @@ class PosSystem:
         self.discount = DiscountService(self.db)
         self.members = MemberService(self.db)
         self.orders = OrderService(self.db, self.menu)
-        self.payments = PaymentService(self.db, self.menu, self.discount, self.members)
+        self.cash = CashService(self.db)
+        self.payments = PaymentService(self.db, self.menu, self.discount, self.members, self.cash)
         self.staff = StaffService(self.db)
         self.reservations = ReservationService(self.db, self.orders)
         self.stats = StatsService(self.db)
-        self.reports = ReportService(self.db, self.discount, self.stats, out_dir)
+        self.reports = ReportService(self.db, self.discount, self.stats, out_dir, self.cash)
         self.auth = AuthService(self.db)
         self.printer = PrinterService(self.db, out_dir)
 

@@ -50,7 +50,8 @@ def init_fonts(root: tk.Misc) -> None:
     style.configure("Big.TButton", font=(FONT_FAMILY, 11, "bold"), padding=8)
     style.configure("Accent.TButton", font=(FONT_FAMILY, 11, "bold"), padding=8,
                     foreground="white", background=COLORS["primary"])
-    style.map("Accent.TButton", background=[("active", COLORS["primary_dark"])])
+    style.map("Accent.TButton", background=[("disabled", "#cbd5e1"), ("active", COLORS["primary_dark"])],
+              foreground=[("disabled", "#f8fafc")])
     style.configure("Danger.TButton", foreground="white", background=COLORS["danger"])
     style.map("Danger.TButton", background=[("active", "#a52714")])
 

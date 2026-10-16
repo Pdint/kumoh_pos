@@ -30,6 +30,7 @@ class PosTestCase(unittest.TestCase):
         self.pos = PosSystem(":memory:", out_dir=self.tmp.name, now=self.clock)
         self.menu = {m["name"]: m["id"] for m in self.pos.menu.menus()}
         self.ing = {i["name"]: i["id"] for i in self.pos.menu.ingredients()}
+        self.pos.cash.open(100_000, "테스트")  # 현금 결제는 시재 개시가 필요
 
     def tearDown(self):
         self.pos.close()
@@ -297,7 +298,11 @@ class StatsTest(PosTestCase):
         with self.assertRaises(PosError):  # 미결제 주문 존재
             self.pos.reports.close_day("2026-10-12")
         self.pos.payments.pay(oid, "CASH")
+        with self.assertRaises(PosError):  # 시재 정산 전
+            self.pos.reports.close_day("2026-10-12")
+        self.pos.cash.close({50000: 2, 1000: 4, 500: 1})  # 100,000 + 4,500
         text, path = self.pos.reports.close_day("2026-10-12")
+        self.assertIn("[시재 정산]", text)
         self.assertIn("4,500원", text)
         self.assertTrue(os.path.exists(path))
         with self.assertRaises(PosError):
@@ -578,6 +583,95 @@ class NewFeatureTest(PosTestCase):
         cols = {r[1] for r in db.conn.execute("PRAGMA table_info(order_items)")}
         self.assertTrue({"options", "memo", "refunded_qty", "ticket_qty"} <= cols)
         db.close()
+
+
+
+class CashTest(PosTestCase):
+    def test_cash_payment_requires_open_session(self):
+        self.pos.cash.close({50000: 2})
+        oid = self.new_order(떡볶이=1)
+        with self.assertRaises(PosError):
+            self.pos.payments.pay(oid, "CASH")
+        self.pos.payments.pay(oid, "CARD")  # 카드는 시재와 무관
+
+    def test_only_one_open_session_and_amount_rules(self):
+        with self.assertRaises(PosError):
+            self.pos.cash.open(50_000)
+        self.pos.cash.close({50000: 2})
+        for bad in (-10, 105, 2_000_000):
+            with self.assertRaises(PosError):
+                self.pos.cash.open(bad)
+        self.assertEqual(self.pos.cash.default_opening(), 100_000)  # 직전 실제 시재 이월
+
+    def test_expected_cash_calculation(self):
+        oid = self.new_order(쫄면=2)                       # 12,000 현금
+        self.pos.payments.pay(oid, "CASH", received=20_000)  # 거스름돈 8,000 → 순 12,000
+        oid2 = self.new_order(2, 떡볶이=1)
+        self.pos.payments.pay(oid2, "CARD")               # 카드는 제외
+        self.pos.cash.add_movement("IN", 30_000, "잔돈 보충")
+        self.pos.cash.add_movement("OUT", 5_000, "대파 구입")
+        it = self.pos.orders.items(oid)[0]
+        self.pos.payments.refund_items(oid, {it["id"]: 1}, "변심", method="CASH")  # -6,000
+        s = self.pos.cash.summary()
+        self.assertEqual((s["opening"], s["cash_sales"], s["cash_refunds"], s["cash_in"], s["cash_out"]),
+                         (100_000, 12_000, 6_000, 30_000, 5_000))
+        self.assertEqual(s["expected"], 100_000 + 12_000 - 6_000 + 30_000 - 5_000)
+
+    def test_movement_rules(self):
+        with self.assertRaises(PosError):
+            self.pos.cash.add_movement("OUT", 5_000, "")          # 사유 필수
+        with self.assertRaises(PosError):
+            self.pos.cash.add_movement("OUT", 200_000, "은행 입금")  # 금전함보다 많이 출금 불가
+        with self.assertRaises(PosError):
+            self.pos.cash.add_movement("IN", 0, "x")
+
+    def test_check_records_difference_and_keeps_session_open(self):
+        r = self.pos.cash.check({50000: 1, 10000: 4, 5000: 1, 1000: 4})  # 99,000
+        self.assertEqual(r["difference"], -1_000)
+        self.assertIsNotNone(self.pos.cash.current())
+        self.assertEqual(self.pos.cash.checks(r["session_id"])[0]["kind"], "CHECK")
+
+    def test_close_requires_reason_and_admin_for_large_difference(self):
+        with self.assertRaises(PosError):  # 과부족 사유 없음
+            self.pos.cash.close({50000: 1, 10000: 4, 5000: 1, 1000: 4})
+        with self.assertRaises(PosError):  # 1만원 이상 차이는 관리자만
+            self.pos.cash.close({50000: 1, 10000: 3}, note="모름")
+        self.pos.auth.login("0000")
+        r = self.pos.cash.close({50000: 1, 10000: 3}, note="거스름돈 실수")
+        self.assertEqual(r["difference"], -20_000)
+        s = self.pos.cash.get(r["session_id"])
+        self.assertEqual((s["status"], s["counted_cash"], s["difference"]), ("CLOSED", 80_000, -20_000))
+        self.assertIn("과부족", self.pos.cash.report_text(r["session_id"]))
+
+    def test_close_exact_without_reason(self):
+        r = self.pos.cash.close({50000: 2})
+        self.assertEqual(r["difference"], 0)
+        with self.assertRaises(PosError):  # 정산 후 입출금 불가
+            self.pos.cash.add_movement("IN", 1_000, "x")
+
+    def test_count_rejects_bad_denominations(self):
+        with self.assertRaises(PosError):
+            self.pos.cash.count_total({3000: 1})
+        with self.assertRaises(PosError):
+            self.pos.cash.count_total({1000: -1})
+        self.assertEqual(self.pos.cash.count_total({50000: 1, 500: 3, 10: 2}), 51_520)
+
+    def test_cash_refund_needs_session_and_enough_cash(self):
+        oid = self.new_order(쫄면=2)
+        self.pos.payments.pay(oid, "CASH")
+        self.pos.cash.add_movement("OUT", 110_000, "은행 입금")  # 금전함 2,000원 남음
+        with self.assertRaises(PosError):
+            self.pos.payments.refund(oid, "변심")
+        self.pos.cash.add_movement("IN", 20_000, "잔돈 보충")
+        self.assertEqual(self.pos.payments.refund(oid, "변심"), 12_000)
+        self.pos.auth.login("0000")
+        self.pos.cash.close({10000: 1}, note="")  # 예상 10,000 = 실제
+        oid2 = self.new_order(2, 떡볶이=1)
+        self.pos.cash.open(10_000)
+        self.pos.payments.pay(oid2, "CASH")
+        self.pos.cash.close({10000: 1, 1000: 4, 500: 1})
+        with self.assertRaises(PosError):  # 시재 없이 현금 환불 불가
+            self.pos.payments.refund(oid2, "변심")
 
 
 if __name__ == "__main__":
