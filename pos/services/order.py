@@ -319,14 +319,16 @@ class OrderService(Service):
         item = self._item(item_id)
         if item["status"] != "WAITING":
             raise PosError("대기 중인 항목만 조리를 시작할 수 있습니다.")
-        self.db.execute("UPDATE order_items SET status='COOKING' WHERE id=?", (item_id,))
+        # 주방에서 처리한 항목은 주방에 전달된 것으로 본다(주문서를 안 뽑았어도 "미전송"으로 남지 않게)
+        self.db.execute("UPDATE order_items SET status='COOKING', ticket_qty=qty WHERE id=?",
+                        (item_id,))
         self.db.commit()
 
     def complete_item(self, item_id: int) -> None:
         item = self._item(item_id)
         if item["status"] == "DONE":
             return
-        self.db.execute("UPDATE order_items SET status='DONE', done_at=? WHERE id=?",
+        self.db.execute("UPDATE order_items SET status='DONE', done_at=?, ticket_qty=qty WHERE id=?",
                         (self.db.now_str(), item_id))
         self._refresh_completed(item["order_id"])
         self.db.commit()

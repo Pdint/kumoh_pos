@@ -474,6 +474,18 @@ class NewFeatureTest(PosTestCase):
         self.assertIn("얼음컵", t2)
         self.assertIn("취소 1", t2)
 
+    def test_kitchen_complete_without_ticket_counts_as_sent(self):
+        # 주문서 없이 주방에서 바로 '조리 완료'를 눌러도 "미전송"으로 남지 않아야 한다
+        oid = self.new_order(떡볶이=1, 콜라=1)
+        a, b = self.pos.orders.items(oid)
+        self.pos.orders.complete_item(a["id"])          # 대기 → 바로 완료
+        self.pos.orders.start_cooking(b["id"])          # 대기 → 조리 시작
+        self.assertEqual(self.pos.orders.pending_ticket_lines(oid), [])
+        with self.assertRaises(PosError):                # 주방 주문서로 다시 나가지 않음
+            self.pos.orders.kitchen_ticket(oid)
+        self.pos.orders.complete_item(b["id"])
+        self.assertIsNotNone(self.pos.orders.get(oid)["completed_at"])
+
     def test_printer_disabled_saves_file(self):
         self.pos.printer.set_enabled(False)
         r = self.pos.printer.print_text("테스트", "t1")
